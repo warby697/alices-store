@@ -45,3 +45,6 @@ next-env.d.ts
 # local tooling
 .netlify/
 *.log
+
+# build artefact, not source
+tsconfig.tsbuildinfo

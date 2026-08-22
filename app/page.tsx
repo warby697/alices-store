@@ -8,7 +8,7 @@ import { PriorityBackfill } from "./PriorityBackfill";
 import { ShopMap, emptyShopLayout, readShopLayout, type ShopLayout } from "./ShopMap";
 import { StockStepper } from "./StockStepper";
 import { YodeymaOrders, type YodeymaOrder } from "./YodeymaOrders";
-import { completeLiveSale, deleteProductNow, loadLiveState, saveLiveState, saveLiveStateNow, saveProductNow } from "./live-store";
+import { completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, saveLiveState, saveLiveStateNow, saveProductNow, writeCachedCatalogue } from "./live-store";
 import { isLowStock } from "./stock-levels";
 
 type Product = {
@@ -96,9 +96,23 @@ function SupplierField({ value, options, onChange }: { value: string; options: s
   );
 }
 
+const greetingFor = (date: Date) => {
+  const hour = date.getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Good evening";
+};
+
 export default function Home() {
   const [staff, setStaff] = useState<Staff | null>(null);
   const [pin, setPin] = useState("");
+  // The till often sits on the sign-in screen untouched for hours, so the
+  // greeting is re-checked on a timer rather than only when something renders.
+  const [greeting, setGreeting] = useState(() => greetingFor(new Date()));
+  useEffect(() => {
+    const timer = setInterval(() => setGreeting(greetingFor(new Date())), 60_000);
+    return () => clearInterval(timer);
+  }, []);
   const [loginError, setLoginError] = useState("");
   const [view, setView] = useState<
     "checkout" | "cash" | "orders" | "backfill" | "map" | "products" | "reports" | "admin"
@@ -114,7 +128,6 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [scanValue, setScanValue] = useState("");
   const [notice, setNotice] = useState("");
-  const [savingTransaction, setSavingTransaction] = useState(false);
   const [payment, setPayment] = useState<"Choose" | TransactionMethod | null>(null);
   const [splitCash, setSplitCash] = useState("");
   const [cashReceived, setCashReceived] = useState("");
@@ -129,9 +142,27 @@ export default function Home() {
   const scannerTime = useRef(0);
   const scannerIdle = useRef<ReturnType<typeof setTimeout> | null>(null);
   const priceMigrationDone = useRef(false);
+  // Saving in the background is what makes the till feel instant, but it opens a
+  // window where a closed tab would lose a transaction. Count what is in flight
+  // and make the browser ask before it lets that happen.
+  const pendingWrites = useRef(0);
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (pendingWrites.current > 0) event.preventDefault();
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, []);
 
   useEffect(() => {
     if (!staff) return;
+    // Paint the last known catalogue first so the till is usable straight away,
+    // then let the server's copy overwrite it a moment later.
+    const cached = readCachedCatalogue();
+    if (cached) {
+      setProducts(cached.products as Product[]);
+      setShopLayout(readShopLayout(cached.shop_layout));
+    }
     void (async () => {
       const live = await loadLiveState();
       setProducts(Array.isArray(live.products) ? live.products as Product[] : []);
@@ -140,8 +171,13 @@ export default function Home() {
       setShopLayout(readShopLayout(live.shop_layout));
       setWalkPicked(live.walk_picked && typeof live.walk_picked === "object" ? live.walk_picked as Record<string, boolean> : {});
       setHydrated(true);
+      writeCachedCatalogue(live.products, live.shop_layout);
     })();
   }, [staff]);
+  // Keep the head start current as stock moves through the day.
+  useEffect(() => {
+    if (hydrated) writeCachedCatalogue(products, shopLayout);
+  }, [hydrated, products, shopLayout]);
   useEffect(() => { if (hydrated) saveLiveState({ yodeyma_orders: yodeymaOrders }); }, [yodeymaOrders, hydrated]);
   useEffect(() => { if (hydrated) saveLiveState({ shop_layout: shopLayout }); }, [shopLayout, hydrated]);
   useEffect(() => { if (hydrated) saveLiveState({ walk_picked: walkPicked }); }, [walkPicked, hydrated]);
@@ -348,8 +384,61 @@ export default function Home() {
     };
   }, [staff, view, payment, editing, products]);
 
+  // Put the transaction on screen immediately and save it in the background.
+  // A till should never hold up the next customer while it waits for a server
+  // to wake up, so the stock change is applied locally first and reconciled
+  // against the server's answer when it lands. A failure undoes just this
+  // transaction rather than restoring an old snapshot, so a sale finishing on
+  // another tablet in the meantime is not clobbered.
+  const commitTransaction = (
+    transaction: Sale,
+    finished: { notice: string; spoken: string },
+  ) => {
+    const sold = new Map(transaction.items.map((item) => [item.id, item.quantity]));
+    const applyStock = (direction: 1 | -1) =>
+      setProducts((current) =>
+        current.map((product) =>
+          sold.has(product.id)
+            ? { ...product, stock: product.stock - direction * (sold.get(product.id) as number) }
+            : product,
+        ),
+      );
+
+    applyStock(1);
+    setSales((current) => [transaction, ...current]);
+    setCart([]);
+    setSearch("");
+    setPayment(null);
+    setSplitCash("");
+    setCashReceived("");
+    setNotice(finished.notice);
+    speak(finished.spoken);
+
+    pendingWrites.current += 1;
+    void (async () => {
+      try {
+        const saved = await completeLiveSale({
+          sale: transaction as unknown as Record<string, unknown>,
+          items: transaction.items.map((item) => ({ id: item.id, quantity: item.quantity })),
+        });
+        if (Array.isArray(saved.products)) setProducts(saved.products as Product[]);
+        if (Array.isArray(saved.sales)) setSales(saved.sales as Sale[]);
+      } catch (error) {
+        applyStock(-1);
+        setSales((current) => current.filter((entry) => entry.id !== transaction.id));
+        setNotice(
+          error instanceof Error
+            ? `NOT SAVED: ${error.message}`
+            : "NOT SAVED — that transaction did not go through, please put it through again",
+        );
+      } finally {
+        pendingWrites.current -= 1;
+      }
+    })();
+  };
+
   const completeSale = async (method: PaymentMethod) => {
-    if (!staff || !cart.length || savingTransaction) return;
+    if (!staff || !cart.length) return;
     const enteredCash = Math.round(Number(splitCash) * 100) / 100;
     const cashTendered = Math.round(Number(cashReceived) * 100) / 100;
     if (method === "Cash" && cashTendered < total) return;
@@ -380,32 +469,15 @@ export default function Home() {
         price: linePrice(l),
       })),
     };
-    setSavingTransaction(true);
-    setNotice("Saving sale…");
-    try {
-      const saved = await completeLiveSale({
-        sale: sale as unknown as Record<string, unknown>,
-        items: cart.map((line) => ({ id: line.product.id, quantity: line.quantity })),
-      });
-      setProducts(Array.isArray(saved.products) ? saved.products as Product[] : products);
-      setSales(Array.isArray(saved.sales) ? saved.sales as Sale[] : sales);
-      setCart([]);
-      setSearch("");
-      setPayment(null);
-      setSplitCash("");
-      setCashReceived("");
-    setNotice(`${method} sale completed — ${money(total)}`);
-      speak(`Sale complete, ${money(total)}`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Sale not saved — please try again");
-    } finally {
-      setSavingTransaction(false);
-    }
+    commitTransaction(sale, {
+      notice: `${method} sale completed — ${money(total)}`,
+      spoken: `Sale complete, ${money(total)}`,
+    });
   };
 
   // One path for both stock-only exits: an owner perk, or something binned.
   const completeStockOnly = async (method: "Owner's Perk" | "Waste") => {
-    if (!staff || !cart.length || savingTransaction) return;
+    if (!staff || !cart.length) return;
     const wasted = method === "Waste";
     const transaction: Sale = {
       id: crypto.randomUUID(),
@@ -423,25 +495,10 @@ export default function Home() {
         price: linePrice(line),
       })),
     };
-    setSavingTransaction(true);
-    setNotice(wasted ? "Recording waste…" : "Saving Owner's Perk…");
-    try {
-      const saved = await completeLiveSale({
-        sale: transaction as unknown as Record<string, unknown>,
-        items: cart.map((line) => ({ id: line.product.id, quantity: line.quantity })),
-      });
-      setProducts(Array.isArray(saved.products) ? saved.products as Product[] : products);
-      setSales(Array.isArray(saved.sales) ? saved.sales as Sale[] : sales);
-      setCart([]);
-      setSearch("");
-      setPayment(null);
-      setNotice(wasted ? "Waste recorded — stock removed" : "Owner's Perk recorded — no payment taken");
-      speak(wasted ? "Waste recorded" : "Owner's Perk recorded");
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Not saved — please try again");
-    } finally {
-      setSavingTransaction(false);
-    }
+    commitTransaction(transaction, {
+      notice: wasted ? "Waste recorded — stock removed" : "Owner's Perk recorded — no payment taken",
+      spoken: wasted ? "Waste recorded" : "Owner's Perk recorded",
+    });
   };
 
   const saveProduct = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -458,14 +515,34 @@ export default function Home() {
       }
     }
     const savedProduct = {...editing, name: editing.name.trim(), price: Math.round(editing.price * 100) / 100, stockConfirmed: true, tillSetupConfirmed: true};
-    setNotice("Saving product...");
+    // Show the edit straight away, save behind it. Same reasoning as a sale:
+    // the server round trip should not be something staff sit and watch.
+    const wasNew = !products.some((product) => product.id === savedProduct.id);
+    setProducts((current) =>
+      wasNew
+        ? [...current, savedProduct as Product]
+        : current.map((product) => (product.id === savedProduct.id ? savedProduct as Product : product)),
+    );
+    setEditing(null);
+    setNotice("Product saved");
+
+    pendingWrites.current += 1;
     try {
       const savedList = await saveProductNow(savedProduct as unknown as Record<string, unknown>);
       setProducts(savedList as unknown as Product[]);
-      setEditing(null);
-      setNotice("Product saved");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Product not saved - please try again");
+      setProducts((current) =>
+        wasNew
+          ? current.filter((product) => product.id !== savedProduct.id)
+          : current.map((product) => (product.id === savedProduct.id ? editing : product)),
+      );
+      setNotice(
+        error instanceof Error
+          ? `NOT SAVED: ${error.message}`
+          : "NOT SAVED — that product change did not go through, please try again",
+      );
+    } finally {
+      pendingWrites.current -= 1;
     }
   };
 
@@ -509,20 +586,22 @@ export default function Home() {
     return (
       <main className="login-shell">
         <section className="login-brand">
-          <div className="brand-stamp">A</div>
+          <h1 className="visually-hidden">Alice’s Store</h1>
           <p className="eyebrow">Ryfields retirement village</p>
-          <h1>Alice’s Store</h1>
+          <img
+            className="login-logo"
+            src="/alices-logo.png"
+            alt="Alice’s Store"
+            width={760}
+            height={1077}
+            fetchPriority="high"
+          />
           <p className="login-intro">A friendlier way to serve the village.</p>
-          <div className="store-scene" aria-hidden="true">
-            <span>Fresh</span>
-            <span>Local</span>
-            <span>Everyday</span>
-          </div>
         </section>
         <section className="pin-panel">
           <div>
             <p className="eyebrow">Staff sign in</p>
-            <h2>Good morning</h2>
+            <h2>{greeting}</h2>
             <p>Enter your four-digit PIN to open the till.</p>
           </div>
           <div
@@ -564,7 +643,7 @@ export default function Home() {
     <main className={`app-shell ${staff.accessible ? "accessible" : ""}`}>
       <aside className="sidebar">
         <div className="side-brand">
-          <div className="brand-stamp small">A</div>
+          <img className="brand-mark" src="/mark-96.png" alt="" width={96} height={96} />
           <div>
             <strong>Alice’s Store</strong>
             <span>Village shop</span>
@@ -1124,10 +1203,9 @@ export default function Home() {
                 </div>
                 <button
                   className={payment === "Waste" ? "danger-button" : "pay-button"}
-                  disabled={savingTransaction}
                   onClick={() => completeStockOnly(payment === "Waste" ? "Waste" : "Owner's Perk")}
                 >
-                  {savingTransaction ? "Saving…" : payment === "Waste" ? "Confirm write-off" : "Confirm Owner's Perk"}
+                  {payment === "Waste" ? "Confirm write-off" : "Confirm Owner's Perk"}
                 </button>
               </>
             ) : (
@@ -1186,7 +1264,6 @@ export default function Home() {
                 <button
                   className="pay-button"
                   disabled={
-                    savingTransaction ||
                     (payment === "Cash" && Number(cashReceived) < total) ||
                     (payment === "Split" &&
                     (!Number(splitCash) ||
@@ -1195,7 +1272,7 @@ export default function Home() {
                   }
                   onClick={() => completeSale(payment as PaymentMethod)}
                 >
-                  {savingTransaction ? "Saving…" : `Confirm ${payment.toLowerCase()} sale`}
+                  {`Confirm ${payment.toLowerCase()} sale`}
                 </button>
               </>
             )}
