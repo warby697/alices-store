@@ -1,13 +1,12 @@
 import { getDatabase } from "@netlify/database";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readLocalState } from "../state/local-store";
 import { createStaffSession, staffCookie } from "./auth";
 
 type Member={name:string;pin:string;role:"Admin"|"Staff";accessible?:boolean;active?:boolean;dailyWage?:number};
 
 async function configuredTeam():Promise<Member[]>{
  if(process.env.NODE_ENV==="development"){
-  try{const state=JSON.parse(await readFile(join(process.cwd(),".local","store-state.json"),"utf8")) as {team?:Member[]};return Array.isArray(state.team)?state.team:[]}catch{return []}
+  try{const state=await readLocalState() as {team?:Member[]};return Array.isArray(state.team)?state.team:[]}catch{return []}
  }
  try{
   const db=getDatabase();

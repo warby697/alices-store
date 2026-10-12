@@ -4,11 +4,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { AdminPanel } from "./AdminPanel";
 import { CashDrawer } from "./CashDrawer";
+import { DailyChecks } from "./DailyChecks";
 import { PriorityBackfill } from "./PriorityBackfill";
-import { ShopMap, emptyShopLayout, readShopLayout, type ShopLayout } from "./ShopMap";
 import { StockStepper } from "./StockStepper";
 import { YodeymaOrders, type YodeymaOrder } from "./YodeymaOrders";
-import { completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, saveLiveState, saveLiveStateNow, saveProductNow, writeCachedCatalogue } from "./live-store";
+import { adjustStockNow, completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
 import { isLowStock } from "./stock-levels";
 
 type Product = {
@@ -32,8 +32,17 @@ type Product = {
   stockConfirmed?: boolean;
   backfillSkipped?: boolean;
   tillSetupConfirmed?: boolean; discontinued?: boolean;
-  fixtureId?: string;
-  shelf?: number;
+  // Set by the server when the till sells something the screen said was out of
+  // stock - the shelf clearly needs counting. Cleared by any deliberate stock
+  // change (restock steppers, edit modal, priority backfill).
+  recount?: boolean;
+  // Loose items (bananas, served coffee, cakes): sold and reported as normal,
+  // but stock is never counted - no number, no low-stock or recount warnings.
+  noStockCount?: boolean;
+  // The same shelf item bought from different shops can carry different
+  // barcodes (Lidl bleach vs Home Bargains bleach). Extra codes collect here
+  // and all ring up / restock the one product.
+  altBarcodes?: string[];
 };
 type CartLine = { product: Product; quantity: number; price?: number };
 // What this line actually sells for: the override if one was typed in at the
@@ -67,7 +76,14 @@ const money = (value: number) =>
     value,
   );
 const todayKey = () => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
-const recommendedPrice = (cost: number) => Math.ceil(cost * 1.3 * 20) / 20;
+// Minimum sensible sale price for a cost, honouring the target margin set in
+// Admin > Controls (rounded up to the nearest 5p).
+const recommendedPrice = (cost: number, marginPercent: number) => Math.ceil(cost * (1 + marginPercent / 100) * 20) / 20;
+
+// Does this barcode belong to this product - its main barcode or any of the
+// extra codes it has collected from other shops' versions of the same item?
+const ownsBarcode = (product: { barcode?: string; altBarcodes?: string[] }, code: string) =>
+  product.barcode === code || (product.altBarcodes || []).includes(code);
 const baseSuppliers = ["Lidl", "Iceland", "Home Bargains", "Heron"];
 
 // Supplier picker: a dropdown of known suppliers plus "Add new supplier..."
@@ -115,14 +131,11 @@ export default function Home() {
   }, []);
   const [loginError, setLoginError] = useState("");
   const [view, setView] = useState<
-    "checkout" | "cash" | "orders" | "backfill" | "map" | "products" | "reports" | "admin"
+    "checkout" | "cash" | "checks" | "orders" | "backfill" | "products" | "reports" | "admin"
   >("checkout");
   const [products, setProducts] = useState<Product[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
   const [yodeymaOrders, setYodeymaOrders] = useState<YodeymaOrder[]>([]);
-  const [shopLayout, setShopLayout] = useState<ShopLayout>(emptyShopLayout);
-  // What has already been picked up on the current shopping trip.
-  const [walkPicked, setWalkPicked] = useState<Record<string, boolean>>({});
   const [cart, setCart] = useState<CartLine[]>([]);
   const [category, setCategory] = useState("Most popular");
   const [search, setSearch] = useState("");
@@ -141,7 +154,33 @@ export default function Home() {
   const scannerBuffer = useRef("");
   const scannerTime = useRef(0);
   const scannerIdle = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const priceMigrationDone = useRef(false);
+  // The stock number showing when the product editor was opened. Saving sends
+  // the DIFFERENCE from this, so "I added 4" stays "add 4" even if the shelf
+  // count moved (a sale on another till) while the editor was open.
+  const editingBaseStock = useRef(0);
+  // Quick restock on the Stock page: the product last scanned, the running
+  // "added this scan" tally shown to staff, and the taps not yet saved. Taps
+  // are batched for half a second so five quick +1s become one server call.
+  const [restockId, setRestockId] = useState<string | null>(null);
+  const [restockAdded, setRestockAdded] = useState(0);
+  const [restockPendingView, setRestockPendingView] = useState(0);
+  const [restockNotice, setRestockNotice] = useState("");
+  const restockPending = useRef(0);
+  const restockTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // An unknown barcode on the Stock page: hold it while staff choose between
+  // "new product" and "another barcode for something we already sell".
+  const [unknownCode, setUnknownCode] = useState<string | null>(null);
+  const [aliasSearch, setAliasSearch] = useState("");
+  // Quick "how many when full?" entry on the restock card for products
+  // without a full-shelf target - fills the shopping list's biggest gap.
+  const [fullDraft, setFullDraft] = useState("");
+  // Which stretch the reports "Top selling products" list covers.
+  const [topPeriod, setTopPeriod] = useState<"today" | "fortnight">("today");
+  // Refund tools on the Reports page.
+  const [refundingId, setRefundingId] = useState("");
+  const [refundNotice, setRefundNotice] = useState("");
+  // Target margin % from Admin > Controls - drives the minimum-price hint.
+  const [targetMargin, setTargetMargin] = useState(30);
   // Saving in the background is what makes the till feel instant, but it opens a
   // window where a closed tab would lose a transaction. Count what is in flight
   // and make the browser ask before it lets that happen.
@@ -161,35 +200,45 @@ export default function Home() {
     const cached = readCachedCatalogue();
     if (cached) {
       setProducts(cached.products as Product[]);
-      setShopLayout(readShopLayout(cached.shop_layout));
     }
     void (async () => {
       const live = await loadLiveState();
       setProducts(Array.isArray(live.products) ? live.products as Product[] : []);
       setSales(Array.isArray(live.sales) ? live.sales as Sale[] : []);
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
-      setShopLayout(readShopLayout(live.shop_layout));
-      setWalkPicked(live.walk_picked && typeof live.walk_picked === "object" ? live.walk_picked as Record<string, boolean> : {});
+      const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
+      if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
       setHydrated(true);
-      writeCachedCatalogue(live.products, live.shop_layout);
+      writeCachedCatalogue(live.products);
     })();
   }, [staff]);
   // Keep the head start current as stock moves through the day.
   useEffect(() => {
-    if (hydrated) writeCachedCatalogue(products, shopLayout);
-  }, [hydrated, products, shopLayout]);
-  useEffect(() => { if (hydrated) saveLiveState({ yodeyma_orders: yodeymaOrders }); }, [yodeymaOrders, hydrated]);
-  useEffect(() => { if (hydrated) saveLiveState({ shop_layout: shopLayout }); }, [shopLayout, hydrated]);
-  useEffect(() => { if (hydrated) saveLiveState({ walk_picked: walkPicked }); }, [walkPicked, hydrated]);
-  useEffect(() => {
-    if (!hydrated || priceMigrationDone.current) return;
-    priceMigrationDone.current = true;
-    const rounded = products.map(product => ({...product, price: product.price > 0 ? Math.round(product.price * 100) / 100 : 0}));
-    if (rounded.some((product,index) => product.price !== products[index].price)) {
-      setProducts(rounded);
-      void saveLiveStateNow({products: rounded});
-    }
+    if (hydrated) writeCachedCatalogue(products);
   }, [hydrated, products]);
+  useEffect(() => { if (hydrated) saveLiveState({ yodeyma_orders: yodeymaOrders }); }, [yodeymaOrders, hydrated]);
+  // Keep every till showing the same numbers: quietly re-fetch the live state
+  // every minute and whenever the tab comes back into view, so a tablet that
+  // has been signed in since morning is never hours out of date. Skipped while
+  // a save is in flight or the product editor is open, so a refresh can never
+  // overwrite what someone is in the middle of doing.
+  useEffect(() => {
+    if (!hydrated) return;
+    let cancelled = false;
+    const refresh = async () => {
+      if (pendingWrites.current > 0 || editing) return;
+      const live = await loadLiveState();
+      if (cancelled || pendingWrites.current > 0) return;
+      if (Array.isArray(live.products)) setProducts(live.products as Product[]);
+      if (Array.isArray(live.sales)) setSales(live.sales as Sale[]);
+      const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
+      if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
+    };
+    const timer = window.setInterval(() => void refresh(), 60000);
+    const onVisible = () => { if (document.visibilityState === "visible") void refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+  }, [hydrated, editing]);
   useEffect(() => {
     const desktopScanner = window.matchMedia(
       "(min-width: 821px) and (pointer: fine)",
@@ -222,8 +271,12 @@ export default function Home() {
       .filter(Boolean).join(" ").toLowerCase();
     return searchTerms.every((term) => searchable.includes(term));
   };
+  // A discontinued product keeps its history and stays on the Stock page,
+  // but leaves the till entirely - no button, no search hit, no mis-rings
+  // against a retired catch-all like the old generic "Can".
   const visibleProducts = products
     .filter((p) =>
+      !p.discontinued &&
       matchesSearch(p) &&
       (searchTerms.length > 0 || category === "All products" || (category === "Most popular" ? Boolean(p.quick) : p.category === category)),
     )
@@ -237,8 +290,23 @@ export default function Home() {
   const itemCount = cart.reduce((sum, line) => sum + line.quantity, 0);
   const todaySales = sales.filter((s) => s.at.slice(0, 10) === todayKey());
   const todayPaidSales = todaySales.filter((s) => !s.stockOnly && !s.refunded);
-  const todayOwnersPerks = todaySales.filter((s) => s.method === "Owner's Perk" && !s.refunded);
   const ownersPerkValue = (sale: Sale) => sale.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  // Refund a sale from the Reports page: the server marks its own copy
+  // refunded and restores the stock, so a stale screen or double tap is safe.
+  const refundSale = async (sale: Sale) => {
+    if (sale.refunded || refundingId) return;
+    setRefundingId(sale.id);
+    try {
+      const saved = await refundSaleNow(sale.id);
+      setSales(saved.sales as unknown as Sale[]);
+      setProducts(saved.products as unknown as Product[]);
+      setRefundNotice("");
+    } catch (error) {
+      setRefundNotice(error instanceof Error ? `REFUND NOT SAVED: ${error.message}` : "REFUND NOT SAVED - please try again");
+    } finally {
+      setRefundingId("");
+    }
+  };
   const todayTotal = todayPaidSales.reduce((sum, s) => sum + s.total, 0);
   const todayCardTakings = todayPaidSales.reduce(
     (sum, s) =>
@@ -251,6 +319,49 @@ export default function Home() {
             : 0)),
     0,
   );
+  const todayCashTakings = todayPaidSales.reduce(
+    (sum, s) =>
+      sum +
+      (s.cashAmount ??
+        (s.method === "Cash"
+          ? s.total
+          : s.method === "Split"
+            ? Math.max(0, s.total - (s.cardAmount || 0))
+            : 0)),
+    0,
+  );
+  // The reports page looks back a fortnight for top sellers and Owner's Perks.
+  const fortnightStart = new Date();
+  fortnightStart.setDate(fortnightStart.getDate() - 13);
+  fortnightStart.setHours(0, 0, 0, 0);
+  const fortnightSales = sales.filter((s) => new Date(s.at) >= fortnightStart);
+  const topSellerSource = (topPeriod === "today" ? todayPaidSales : fortnightSales.filter((s) => !s.stockOnly && !s.refunded));
+  const topSellerTally = new Map<string, { name: string; units: number; takings: number }>();
+  for (const sale of topSellerSource) {
+    for (const item of sale.items) {
+      if (item.id === "yodeyma-order") continue;
+      const row = topSellerTally.get(item.id) || { name: item.name, units: 0, takings: 0 };
+      row.units += item.quantity;
+      row.takings += item.price * item.quantity;
+      row.name = item.name;
+      topSellerTally.set(item.id, row);
+    }
+  }
+  const topSellers = [...topSellerTally.values()]
+    .sort((a, b) => b.units - a.units || a.name.localeCompare(b.name))
+    .slice(0, 10);
+  const fortnightPerks = fortnightSales.filter((s) => s.method === "Owner's Perk" && !s.refunded);
+  const perksByStaff = [...fortnightPerks.reduce((map, sale) => {
+    const row = map.get(sale.staff) || { staff: sale.staff, count: 0, value: 0 };
+    row.count += 1;
+    row.value += sale.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+    return map.set(sale.staff, row);
+  }, new Map<string, { staff: string; count: number; value: number }>()).values()]
+    .sort((a, b) => b.value - a.value || b.count - a.count);
+  const perksByDay = [...fortnightPerks.reduce((map, sale) => {
+    const day = sale.at.slice(0, 10);
+    return map.set(day, [...(map.get(day) || []), sale]);
+  }, new Map<string, Sale[]>()).entries()].sort((a, b) => b[0].localeCompare(a[0]));
 
   const speak = (text: string) => {
     if (!staff?.accessible || !("speechSynthesis" in window)) return;
@@ -286,19 +397,14 @@ export default function Home() {
       speak(`${product.name}, selling price needed`);
       return;
     }
-    if (product.stock <= 0) {
-      setNotice(`${product.name} is out of stock`);
-      speak(`${product.name}, out of stock`);
-      return;
-    }
+    // The item being scanned is more real than the number on the screen, so a
+    // "0 in stock" product still sells - the sale flags it for a shelf recount
+    // instead of blocking the customer.
+    const inCart = cart.find((line) => line.product.id === product.id)?.quantity || 0;
+    const beyondStock = !product.noStockCount && inCart + 1 > product.stock;
     setCart((current) => {
       const exists = current.find((line) => line.product.id === product.id);
       if (exists) {
-        if (exists.quantity >= product.stock) {
-          setNotice(`Only ${product.stock} ${product.name} in stock`);
-          speak(`Only ${product.stock} in stock`);
-          return current;
-        }
         return current.map((line) =>
           line.product.id === product.id
             ? { ...line, quantity: line.quantity + 1 }
@@ -307,24 +413,29 @@ export default function Home() {
       }
       return [...current, { product, quantity: 1 }];
     });
-    setNotice(`${product.name} added`);
-    speak(`${product.name}, ${money(product.price)}`);
+    if (beyondStock) {
+      setNotice(`${product.name} added - stock showed ${product.stock}, so the shelf will be flagged for a recount`);
+      speak(`${product.name}, ${money(product.price)}. Stock count needs checking.`);
+    } else {
+      setNotice(`${product.name} added`);
+      speak(`${product.name}, ${money(product.price)}`);
+    }
   };
 
   const changeQuantity = (id: string, delta: number) =>
     setCart((current) => current
       .map((line) => {
         if (line.product.id !== id) return line;
-        const quantity = Math.min(line.product.stock, line.quantity + delta);
-        if (delta > 0 && quantity === line.quantity)
-          setNotice(`Only ${line.product.stock} ${line.product.name} in stock`);
+        const quantity = line.quantity + delta;
+        if (delta > 0 && !line.product.noStockCount && quantity > line.product.stock)
+          setNotice(`Stock showed ${line.product.stock} ${line.product.name} - selling anyway, shelf will be flagged for a recount`);
         return { ...line, quantity };
       })
       .filter((line) => line.quantity > 0));
   const handleScan = () => {
     const code = scanValue.trim();
     if (!code) return;
-    const product = products.find((p) => p.barcode === code);
+    const product = products.find((p) => ownsBarcode(p, code));
     if (product) addProduct(product);
     else {
       setNotice(`Unknown barcode ${code}`);
@@ -342,6 +453,23 @@ export default function Home() {
     setScanValue("");
   };
 
+  // What to do with a finished barcode on the till. Kept in a ref so the
+  // window listener below can stay registered while stock numbers change
+  // underneath it - re-registering the listener mid-scan wipes the half-read
+  // barcode (the refresh every minute made that a real problem).
+  const checkoutScan = (code: string) => {
+    const product = products.find((item) => ownsBarcode(item, code));
+    if (product) addProduct(product);
+    else {
+      setNotice(`Barcode ${code} is not in the catalogue — add it in Add products`);
+      speak(`Unknown barcode`);
+    }
+    setSearch("");
+    setScanValue("");
+  };
+  const checkoutScanRef = useRef(checkoutScan);
+  useEffect(() => { checkoutScanRef.current = checkoutScan; });
+
   useEffect(() => {
     if (!staff || view !== "checkout" || payment || editing) return;
     const finishScannerCode = () => {
@@ -350,14 +478,7 @@ export default function Home() {
       if (scannerIdle.current) clearTimeout(scannerIdle.current);
       scannerIdle.current = null;
       if (code.length < 6) return;
-      const product = products.find((item) => item.barcode === code);
-      if (product) addProduct(product);
-      else {
-        setNotice(`Barcode ${code} is not in the catalogue — add it in Add products`);
-        speak(`Unknown barcode`);
-      }
-      setSearch("");
-      setScanValue("");
+      checkoutScanRef.current(code);
     };
     const onScannerKey = (event: KeyboardEvent) => {
       const now = Date.now();
@@ -382,7 +503,157 @@ export default function Home() {
       scannerIdle.current = null;
       scannerBuffer.current = "";
     };
-  }, [staff, view, payment, editing, products]);
+  }, [staff, view, payment, editing]);
+
+  // ---- Quick restock (Stock page) ----
+  // Send the batched-up taps for one product to the server as a single "add
+  // N" instruction. On failure the taps are put back, so tapping + or - again
+  // retries them rather than losing the count.
+  const flushRestock = async (id: string) => {
+    const delta = restockPending.current;
+    restockPending.current = 0;
+    if (!delta) return;
+    pendingWrites.current += 1;
+    try {
+      const saved = await adjustStockNow([{ id, delta }], { reason: "restock" });
+      setProducts(saved.products as unknown as Product[]);
+      setRestockPendingView(0);
+    } catch (error) {
+      restockPending.current += delta;
+      setRestockNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - tap + or - to try again");
+    } finally {
+      pendingWrites.current -= 1;
+    }
+  };
+  const adjustRestock = (id: string, delta: number) => {
+    const product = products.find((candidate) => candidate.id === id);
+    const shown = (product?.stock || 0) + restockPending.current;
+    if (delta < 0 && shown <= 0) return;
+    restockPending.current += delta;
+    setRestockPendingView((current) => current + delta);
+    setRestockAdded((current) => current + delta);
+    setRestockNotice("");
+    if (restockTimer.current) clearTimeout(restockTimer.current);
+    restockTimer.current = setTimeout(() => void flushRestock(id), 500);
+  };
+  // A barcode arriving on the Stock page: show the product with big + / -
+  // controls, and NOTHING more. A scan never changes stock by itself - an
+  // accidental double-scan or a "did that take?" re-scan used to add phantom
+  // stock (turned off 18 Sep at the owner's request). Only the + / - and
+  // "+ case" buttons move the count. An unknown barcode opens the add-product
+  // form with the code already filled in.
+  const restockScan = (code: string) => {
+    const product = products.find((candidate) => ownsBarcode(candidate, code) || (candidate.caseBarcode && candidate.caseBarcode === code));
+    if (!product) {
+      // Not in the catalogue: could be a genuinely new product, or the same
+      // shelf item bought from a different shop with a different barcode
+      // (bleach is bleach). Staff choose on the card.
+      setUnknownCode(code);
+      setAliasSearch("");
+      setNotice("");
+      return;
+    }
+    setUnknownCode(null);
+    if (restockId !== product.id) {
+      // Different product: save anything still pending on the old one first.
+      if (restockId && restockTimer.current) {
+        clearTimeout(restockTimer.current);
+        void flushRestock(restockId);
+      }
+      restockPending.current = 0;
+      setRestockPendingView(0);
+      setRestockAdded(0);
+      setRestockNotice("");
+      setFullDraft("");
+      setRestockId(product.id);
+    }
+    setSearch("");
+    speak(product.name);
+  };
+  // The unknown-barcode chooser's two exits: start a brand-new product with
+  // the code filled in, or attach the code to an existing product so both
+  // barcodes ring up and restock the same item from now on.
+  const startNewFromCode = (code: string) => {
+    setUnknownCode(null);
+    editingBaseStock.current = 0;
+    setEditing({ id: crypto.randomUUID(), name: "", price: 0, cost: 0, stock: 0, category: "Groceries", barcode: code, colour: "#c7d9c0" });
+  };
+  const addAliasTo = async (product: Product, code: string) => {
+    setUnknownCode(null);
+    try {
+      const saved = await saveProductNow({ ...product, altBarcodes: [...(product.altBarcodes || []), code] } as unknown as Record<string, unknown>);
+      setProducts(saved as unknown as Product[]);
+      restockPending.current = 0;
+      setRestockPendingView(0);
+      setRestockAdded(0);
+      setRestockNotice("");
+      setFullDraft("");
+      setRestockId(product.id);
+      setNotice(`${code} added as another barcode for ${product.name}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - please try again");
+    }
+  };
+  const saveFullTarget = async (product: Product) => {
+    const full = Math.floor(Number(fullDraft));
+    if (!(full > 0)) return;
+    try {
+      const saved = await saveProductNow({ ...product, full } as unknown as Record<string, unknown>);
+      setProducts(saved as unknown as Product[]);
+      setFullDraft("");
+      setNotice(`${product.name}: full shelf is ${full}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - please try again");
+    }
+  };
+  // The same silent scanner-listening trick as the till: a fast burst of
+  // digits ending in Enter (or a pause) is a scanner, wherever focus is - so
+  // on a phone with a pocket scanner nothing needs tapping first. The handler
+  // lives in a ref for the same reason as the till's: the listener must stay
+  // put while stock numbers change mid-scan.
+  const restockScanRef = useRef(restockScan);
+  useEffect(() => { restockScanRef.current = restockScan; });
+  useEffect(() => {
+    if (!staff || view !== "products" || editing) return;
+    const finishScannerCode = () => {
+      const code = scannerBuffer.current;
+      scannerBuffer.current = "";
+      if (scannerIdle.current) clearTimeout(scannerIdle.current);
+      scannerIdle.current = null;
+      if (code.length < 6) return;
+      restockScanRef.current(code);
+    };
+    const onScannerKey = (event: KeyboardEvent) => {
+      const now = Date.now();
+      if (now - scannerTime.current > 2000) scannerBuffer.current = "";
+      scannerTime.current = now;
+      if (/^[0-9]$/.test(event.key)) {
+        scannerBuffer.current += event.key;
+        if (scannerIdle.current) clearTimeout(scannerIdle.current);
+        scannerIdle.current = setTimeout(finishScannerCode, 1200);
+        return;
+      }
+      if (event.key !== "Enter" && event.key !== "Tab") return;
+      if (scannerBuffer.current.length < 6) return;
+      event.preventDefault();
+      event.stopPropagation();
+      finishScannerCode();
+    };
+    window.addEventListener("keydown", onScannerKey, true);
+    return () => {
+      window.removeEventListener("keydown", onScannerKey, true);
+      if (scannerIdle.current) clearTimeout(scannerIdle.current);
+      scannerIdle.current = null;
+      scannerBuffer.current = "";
+    };
+  }, [staff, view, editing]);
+  // Leaving the Stock page saves any taps still waiting on the timer.
+  useEffect(() => {
+    if (view === "products" || !restockId) return;
+    if (restockTimer.current) clearTimeout(restockTimer.current);
+    void flushRestock(restockId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
 
   // Put the transaction on screen immediately and save it in the background.
   // A till should never hold up the next customer while it waits for a server
@@ -398,7 +669,7 @@ export default function Home() {
     const applyStock = (direction: 1 | -1) =>
       setProducts((current) =>
         current.map((product) =>
-          sold.has(product.id)
+          sold.has(product.id) && !product.noStockCount
             ? { ...product, stock: product.stock - direction * (sold.get(product.id) as number) }
             : product,
         ),
@@ -501,6 +772,79 @@ export default function Home() {
     });
   };
 
+  // Gone-off stock gets written off right where the scanning happens: scan
+  // the item on the Stock page, tap once per unit binned. It goes through the
+  // same locked sale route as the till's write-off, so Reports and the stock
+  // movement log both see it - unlogged waste was a proven cause of counts
+  // reading higher than the shelf.
+  const writeOffFromShelf = (product: Product) => {
+    if (!staff) return;
+    const transaction: Sale = {
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      staff: staff.name,
+      method: "Waste",
+      total: product.price,
+      cashAmount: 0,
+      cardAmount: 0,
+      stockOnly: true,
+      items: [{ id: product.id, name: product.name, quantity: 1, price: product.price }],
+    };
+    setSales((current) => [transaction, ...current]);
+    const counted = !product.noStockCount;
+    if (counted) setProducts((current) => current.map((p) => (p.id === product.id ? { ...p, stock: Math.max(0, p.stock - 1) } : p)));
+    setRestockNotice(`1 written off - tap again for each one binned`);
+    pendingWrites.current += 1;
+    void (async () => {
+      try {
+        const saved = await completeLiveSale({ sale: transaction as unknown as Record<string, unknown>, items: [{ id: product.id, quantity: 1 }] });
+        if (Array.isArray(saved.products)) setProducts(saved.products as Product[]);
+        if (Array.isArray(saved.sales)) setSales(saved.sales as Sale[]);
+      } catch (error) {
+        setSales((current) => current.filter((entry) => entry.id !== transaction.id));
+        if (counted) setProducts((current) => current.map((p) => (p.id === product.id ? { ...p, stock: p.stock + 1 } : p)));
+        setRestockNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - please tap again");
+      } finally {
+        pendingWrites.current -= 1;
+      }
+    })();
+  };
+
+  // A Yodeyma collection payment is a sale with no shelf product behind it, so
+  // it goes through the same locked sale route as everything else (the server
+  // records sale lines that are not catalogue products without touching stock).
+  // Before this it only ever lived in the screen's memory and vanished on
+  // sign-out, so these payments never reached the reports.
+  const recordYodeymaPayment = (method: "Cash" | "Card", amount: number, customer: string) => {
+    if (!staff || amount <= 0) return;
+    const transaction: Sale = {
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      staff: staff.name,
+      method,
+      total: amount,
+      cashAmount: method === "Cash" ? amount : undefined,
+      cardAmount: method === "Card" ? amount : undefined,
+      items: [{ id: "yodeyma-order", name: `Yodeyma payment - ${customer}`, quantity: 1, price: amount }],
+    };
+    setSales((current) => [transaction, ...current]);
+    pendingWrites.current += 1;
+    void (async () => {
+      try {
+        const saved = await completeLiveSale({
+          sale: transaction as unknown as Record<string, unknown>,
+          items: transaction.items.map((item) => ({ id: item.id, quantity: item.quantity })),
+        });
+        if (Array.isArray(saved.sales)) setSales(saved.sales as Sale[]);
+      } catch (error) {
+        setSales((current) => current.filter((entry) => entry.id !== transaction.id));
+        setNotice(error instanceof Error ? `PAYMENT NOT SAVED: ${error.message}` : "PAYMENT NOT SAVED - please record it again");
+      } finally {
+        pendingWrites.current -= 1;
+      }
+    })();
+  };
+
   const saveProduct = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!editing?.name || editing.price <= 0) return;
@@ -508,13 +852,13 @@ export default function Home() {
     // barcode that is already on a different product.
     const enteredBarcode = editing.barcode?.trim();
     if (enteredBarcode) {
-      const clash = products.find((p) => p.id !== editing.id && p.barcode?.trim() === enteredBarcode);
+      const clash = products.find((p) => p.id !== editing.id && (p.barcode?.trim() === enteredBarcode || (p.altBarcodes || []).includes(enteredBarcode)));
       if (clash) {
         setNotice(`That barcode is already on "${clash.name}". Two products cannot share a barcode.`);
         return;
       }
     }
-    const savedProduct = {...editing, name: editing.name.trim(), price: Math.round(editing.price * 100) / 100, stockConfirmed: true, tillSetupConfirmed: true};
+    const savedProduct = {...editing, name: editing.name.trim(), price: Math.round(editing.price * 100) / 100, stockConfirmed: true, tillSetupConfirmed: true, ...(editing.noStockCount ? { stock: 0, full: undefined, recount: undefined } : {})};
     // Show the edit straight away, save behind it. Same reasoning as a sale:
     // the server round trip should not be something staff sit and watch.
     const wasNew = !products.some((product) => product.id === savedProduct.id);
@@ -528,8 +872,24 @@ export default function Home() {
 
     pendingWrites.current += 1;
     try {
-      const savedList = await saveProductNow(savedProduct as unknown as Record<string, unknown>);
+      // The server keeps its own live stock for an existing product, so send
+      // the stock ADJUSTMENT made in the editor rather than the number itself.
+      const stockChange = editing.stock - editingBaseStock.current;
+      const savedList = await saveProductNow(
+        savedProduct as unknown as Record<string, unknown>,
+        !wasNew && stockChange !== 0 && !savedProduct.noStockCount ? { delta: stockChange } : undefined,
+        "edit",
+      );
       setProducts(savedList as unknown as Product[]);
+      // A product just created on the Stock page (usually from an unknown
+      // barcode) lands straight in the restock card, ready for + taps.
+      if (wasNew && view === "products") {
+        restockPending.current = 0;
+        setRestockPendingView(0);
+        setRestockAdded(0);
+        setRestockNotice("");
+        setRestockId(savedProduct.id);
+      }
     } catch (error) {
       setProducts((current) =>
         wasNew
@@ -662,20 +1022,18 @@ export default function Home() {
           >
             <span>£</span> Cash drawer
           </button>
-          <button className={view === "map" ? "active" : ""} onClick={() => setView("map")}>
-            <span>▦</span> Shop map
+          <button className={view === "checks" ? "active" : ""} onClick={() => setView("checks")}>
+            <span>✓</span> Daily checks
           </button>
           <button className={view === "orders" ? "active" : ""} onClick={() => setView("orders")}>
             <span>◇</span> Yodeyma orders {yodeymaOrders.filter(o=>o.status==="Needs ordering").length ? `(${yodeymaOrders.filter(o=>o.status==="Needs ordering").length})` : ""}
           </button>
-          {staff.admin && (
-            <button
-              className={view === "products" ? "active" : ""}
-              onClick={openProductLibrary}
-            >
-              <span>□</span> Product library
-            </button>
-          )}
+          <button
+            className={view === "products" ? "active" : ""}
+            onClick={openProductLibrary}
+          >
+            <span>□</span> Stock
+          </button>
           {staff.admin && (
             <button
               className={view === "reports" ? "active" : ""}
@@ -743,22 +1101,24 @@ export default function Home() {
                 ? "New sale"
                 : view === "cash"
                   ? "Cash drawer"
+                  : view === "checks"
+                    ? "Daily checks"
                   : view === "orders"
                     ? "Yodeyma orders"
-                  : view === "map"
-                    ? "Shop map"
                   : view === "backfill"
                     ? "Priority backfill"
                     : view === "products"
-                      ? "Product library"
+                      ? "Stock"
                       : view === "reports"
                         ? "Shop report"
                         : "Administration"}
             </h1>
           </div>
-          <div className="scanner-state">
-            <i /> Scanner ready
-          </div>
+          {(view === "checkout" || view === "products") && (
+            <div className="scanner-state">
+              <i /> Scanner ready
+            </div>
+          )}
         </header>
         {notice && (
           <div className="notice" role="status">
@@ -822,16 +1182,15 @@ export default function Home() {
                 {visibleProducts.map((product) => (
                   <button
                     type="button"
-                    className={`product-card ${product.stock <= 0 ? "out-of-stock" : ""}`}
+                    className={`product-card ${!product.noStockCount && product.stock <= 0 ? "out-of-stock" : ""}`}
                     key={product.id}
                     onClick={() => addProduct(product)}
-                    disabled={product.stock <= 0}
                   >
                     <div className="product-info">
                       <strong>{product.name}</strong>
                       {product.size && <small>{product.size}</small>}
-                      <span>{product.stock} in stock</span>
-                      {product.stock <= 0 ? <b>Out of stock</b> : isLowStock(product) && <b>Low stock</b>}
+                      {!product.noStockCount && <span>{product.stock} in stock</span>}
+                      {!product.noStockCount && (product.stock <= 0 ? <b>Shows 0 - still sells</b> : isLowStock(product) && <b>Low stock</b>)}
                     </div>
                     <em>{money(product.price)}</em>
                   </button>
@@ -900,6 +1259,7 @@ export default function Home() {
                           >
                             {money(linePrice(line))} each
                             {typeof line.price === "number" && <em>was {money(line.product.price)}</em>}
+                            <i className="price-tag">{typeof line.price === "number" ? "reduced" : "change price"}</i>
                           </button>
                         )}
                       </div>
@@ -955,42 +1315,154 @@ export default function Home() {
           </div>
         )}
         {view === "cash" && <CashDrawer sales={sales} staff={staff.name} dailyWage={staff.dailyWage || 0} />}
-        {view === "orders" && <YodeymaOrders orders={yodeymaOrders} setOrders={setYodeymaOrders} staff={staff.name} onPayment={(method,amount,customer)=>setSales(current=>[{id:crypto.randomUUID(),at:new Date().toISOString(),staff:staff.name,method,total:amount,cashAmount:method==="Cash"?amount:undefined,cardAmount:method==="Card"?amount:undefined,items:[{id:"yodeyma-order",name:`Yodeyma payment - ${customer}`,quantity:1,price:amount}]},...current])} />}
-        {view === "map" && (
-          <ShopMap
-            products={products}
-            setProducts={setProducts}
-            layout={shopLayout}
-            setLayout={setShopLayout}
-            canEdit={Boolean(staff.admin)}
-            picked={walkPicked}
-            setPicked={setWalkPicked}
-            onExit={() => setView("checkout")}
-          />
-        )}
-        {view === "backfill" && staff.admin && (
+        {view === "checks" && <DailyChecks staff={staff.name} />}
+        {view === "orders" && <YodeymaOrders orders={yodeymaOrders} setOrders={setYodeymaOrders} staff={staff.name} onPayment={recordYodeymaPayment} />}
+        {view === "backfill" && (
           <PriorityBackfill products={products} setProducts={setProducts} onExit={() => setView("products")} />
         )}
 
         {view === "products" && (
           <section className="management-page">
+            {(() => {
+              if (unknownCode) {
+                const matches = products
+                  .filter((p) => !aliasSearch.trim() || p.name.toLowerCase().includes(aliasSearch.trim().toLowerCase()))
+                  .slice(0, 6);
+                return (
+                  <div className="restock-card alias-chooser">
+                    <div className="restock-info">
+                      <strong>{unknownCode} isn&apos;t in the catalogue</strong>
+                      <small>Is it a brand-new product, or a different shop&apos;s barcode for something we already sell?</small>
+                    </div>
+                    <div className="alias-options">
+                      <button type="button" className="primary-small" onClick={() => startNewFromCode(unknownCode)}>+ New product</button>
+                      <button type="button" onClick={() => setUnknownCode(null)}>Cancel</button>
+                    </div>
+                    <div className="alias-pick">
+                      <input
+                        value={aliasSearch}
+                        onChange={(e) => setAliasSearch(e.target.value)}
+                        placeholder="Or type a name to add this barcode to an existing product..."
+                      />
+                      {aliasSearch.trim() && matches.map((p) => (
+                        <button type="button" key={p.id} onClick={() => void addAliasTo(p, unknownCode)}>
+                          <strong>{p.name}</strong>
+                          <small>{money(p.price)}{p.noStockCount ? "" : ` · ${p.stock} in stock`}</small>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                );
+              }
+              const scanned = restockId ? products.find((p) => p.id === restockId) : null;
+              return (
+                <div className={`restock-card${scanned ? "" : " waiting"}`}>
+                  {scanned ? (
+                    <>
+                      <div className="restock-info">
+                        <strong>{scanned.name}</strong>
+                        <small>
+                          {money(scanned.price)}
+                          {scanned.size ? ` · ${scanned.size}` : ""}
+                          {isLowStock(scanned) ? " · LOW STOCK" : ""}
+                        </small>
+                        {restockNotice && <em className="restock-error">{restockNotice}</em>}
+                      </div>
+                      {scanned.noStockCount ? (
+                        <div className="restock-uncounted">Stock isn&apos;t counted for this item - nothing to add or adjust.</div>
+                      ) : (
+                        <div className="restock-controls">
+                          <button type="button" aria-label="One fewer in stock" onClick={() => adjustRestock(scanned.id, -1)}>−</button>
+                          <div className="restock-count">
+                            <b>{scanned.stock + restockPendingView}</b>
+                            <small>in stock{restockAdded ? ` · ${restockAdded > 0 ? "+" : ""}${restockAdded} just now` : ""}</small>
+                          </div>
+                          <button type="button" aria-label="One more in stock" onClick={() => adjustRestock(scanned.id, 1)}>+</button>
+                        </div>
+                      )}
+                      <div className="restock-side">
+                        {!scanned.noStockCount && (scanned.caseQuantity || 0) > 1 && (
+                          <button type="button" onClick={() => adjustRestock(scanned.id, scanned.caseQuantity || 1)}>+ case of {scanned.caseQuantity}</button>
+                        )}
+                        <button type="button" onClick={() => { editingBaseStock.current = scanned.stock; setEditing(scanned); }}>Full details</button>
+                        <button type="button" className="restock-waste" onClick={() => writeOffFromShelf(scanned)}>Gone off - write off 1</button>
+                      </div>
+                      {!scanned.noStockCount && !(scanned.full && scanned.full > 0) && (
+                        <div className="restock-full-prompt">
+                          <span>How many when the shelf is full? Sets it up for the shopping list.</span>
+                          <input
+                            type="number"
+                            min="1"
+                            inputMode="numeric"
+                            placeholder="e.g. 6"
+                            value={fullDraft}
+                            onChange={(e) => setFullDraft(e.target.value)}
+                          />
+                          <button type="button" disabled={!(Number(fullDraft) > 0)} onClick={() => void saveFullTarget(scanned)}>Set</button>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="restock-info">
+                      <strong>Scan a barcode to restock</strong>
+                      <small>Nothing to tap first - the scan brings the product up. Then use the + and - buttons to change the count; scanning alone never changes stock. A new barcode opens the add-product form.</small>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+            {(() => {
+              // Shelves the till flagged: something sold while the screen said
+              // 0, so the number is wrong somewhere. Any stock change clears
+              // the flag - or "count is right" confirms it without changing.
+              const flagged = products.filter((p) => p.recount && !p.discontinued && !p.noStockCount);
+              if (!flagged.length) return null;
+              const openOnCard = (p: Product) => {
+                if (restockId && restockTimer.current) { clearTimeout(restockTimer.current); void flushRestock(restockId); }
+                restockPending.current = 0;
+                setRestockPendingView(0);
+                setRestockAdded(0);
+                setRestockNotice("");
+                setFullDraft("");
+                setRestockId(p.id);
+              };
+              const confirmRight = async (p: Product) => {
+                try {
+                  const saved = await adjustStockNow([{ id: p.id, delta: 0 }], { reason: "count" });
+                  setProducts(saved.products as unknown as Product[]);
+                  setNotice(`${p.name}: count confirmed at ${p.stock}`);
+                } catch (error) {
+                  setNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - please try again");
+                }
+              };
+              return (
+                <div className="recount-banner">
+                  <strong>⚠ {flagged.length === 1 ? "1 shelf needs a recount" : `${flagged.length} shelves need a recount`}</strong>
+                  <small>The till sold these while the screen said 0. Count the shelf, tap the name and put the real number in - or tick if the number showing is already right.</small>
+                  {flagged.map((p) => (
+                    <div className="recount-row" key={p.id}>
+                      <button type="button" onClick={() => openOnCard(p)}><strong>{p.name}</strong><small>shows {p.stock} in stock</small></button>
+                      <button type="button" className="recount-ok" onClick={() => void confirmRight(p)}>✓ {p.stock} is right</button>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
             <div className="management-actions">
-              <div className="management-intro"><p className="eyebrow">Existing catalogue</p><p>Find a product to inspect, edit or delete it.</p></div>
               <div className="search-box">
                 <span>⌕</span>
                 <input
                   ref={productSearchRef}
-                  autoFocus
                   inputMode="search"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search product library"
+                  placeholder="Search stock"
                 />
-                {search && <button type="button" aria-label="Clear product library search" onClick={() => setSearch("")}>×</button>}
+                {search && <button type="button" aria-label="Clear stock search" onClick={() => setSearch("")}>×</button>}
               </div>
               <div className="management-buttons">
                 <button className="primary-small" onClick={() => setView("backfill")}>Priority backfill</button>
-                <button className="primary-small" onClick={() => setEditing({id:crypto.randomUUID(),name:"",price:0,cost:0,stock:0,category:"Groceries",colour:"#c7d9c0"})}>+ Add product</button>
+                <button className="primary-small" onClick={() => { editingBaseStock.current = 0; setEditing({id:crypto.randomUUID(),name:"",price:0,cost:0,stock:0,category:"Groceries",colour:"#c7d9c0"}); }}>+ Add product</button>
               </div>
             </div>
             <div className="product-table">
@@ -1018,7 +1490,7 @@ export default function Home() {
                     <span>{p.category}</span>
                     <span className={isLowStock(p) ? "low" : ""}>
                       {isLowStock(p) ? "● " : ""}
-                      {p.stock}
+                      {p.noStockCount ? "Not counted" : p.stock}
                     </span>
                     <strong>{money(p.price)}</strong>
                     <span>
@@ -1026,14 +1498,14 @@ export default function Home() {
                         ? `${Math.round(((p.price - p.cost) / p.price) * 100)}%`
                         : "—"}
                     </span>
-                    <button onClick={() => setEditing(p)}>Edit</button>
+                    <button onClick={() => { editingBaseStock.current = p.stock; setEditing(p); }}>Edit</button>
                   </div>
                 ))}
             </div>
           </section>
         )}
 
-        {view === "reports" && (
+        {view === "reports" && staff.admin && (
           <section className="reports-page">
             <div className="metric-grid">
               <article>
@@ -1056,6 +1528,11 @@ export default function Home() {
                 <small>Taken on the card reader</small>
               </article>
               <article>
+                <span>Cash takings</span>
+                <strong>{money(todayCashTakings)}</strong>
+                <small>Into the drawer</small>
+              </article>
+              <article>
                 <span>Estimated net margin</span>
                 <strong>
                   {money(
@@ -1076,61 +1553,80 @@ export default function Home() {
             <div className="report-columns">
               <article className="report-card">
                 <div className="section-title">
-                  <h2>Recent sales</h2>
-                  <span>Today</span>
+                  <h2>Top selling products</h2>
+                  <div className="period-toggle">
+                    <button type="button" className={topPeriod === "today" ? "active" : ""} onClick={() => setTopPeriod("today")}>Today</button>
+                    <button type="button" className={topPeriod === "fortnight" ? "active" : ""} onClick={() => setTopPeriod("fortnight")}>Last 14 days</button>
+                  </div>
                 </div>
-                {todayPaidSales.length ? (
-                  todayPaidSales.map((s) => (
-                    <div className="sale-row" key={s.id}>
-                      <span className="sale-icon">
-                        {s.method === "Card"
-                          ? "◇"
-                          : s.method === "Split"
-                            ? "½"
-                            : "£"}
-                      </span>
+                {topSellers.length ? (
+                  topSellers.map((row, index) => (
+                    <div className="sale-row" key={row.name + index}>
+                      <span className="sale-icon">{index + 1}</span>
                       <span>
-                        <strong>{s.method} sale</strong>
-                        <small>
-                          {new Date(s.at).toLocaleTimeString("en-GB", {
-                            hour: "2-digit",
-                            minute: "2-digit",
-                          })}{" "}
-                          · {s.staff} ·{" "}
-                          {s.items.reduce((n, i) => n + i.quantity, 0)} items
-                        </small>
+                        <strong>{row.name}</strong>
+                        <small>{row.units} sold</small>
                       </span>
-                      <strong>{money(s.total)}</strong>
+                      <strong>{money(row.takings)}</strong>
                     </div>
                   ))
                 ) : (
                   <div className="empty-report">
-                    No sales recorded yet. Complete a basket to see it here.
+                    No sales {topPeriod === "today" ? "yet today" : "in the last 14 days"}.
                   </div>
                 )}
               </article>
               <article className="report-card">
                 <div className="section-title">
-                  <h2>Stock attention</h2>
-                  <span>Live</span>
+                  <h2>Owner&apos;s Perks</h2>
+                  <span>Last 14 days · {fortnightPerks.length} taken</span>
                 </div>
-                {products
-                  .filter(isLowStock)
-                  .map((p) => (
-                    <div className="stock-row" key={p.id}>
-                      <i style={{ background: p.colour }}>{p.name[0]}</i>
-                      <span>
-                        <strong>{p.name}</strong>
-                        <small>{p.category}</small>
-                      </span>
-                      <b>{p.stock} left</b>
+                {perksByStaff.length > 0 && (
+                  <div className="perk-ranking">
+                    {perksByStaff.map((row) => (
+                      <span key={row.staff}><strong>{row.staff}</strong> {money(row.value)} ({row.count})</span>
+                    ))}
+                  </div>
+                )}
+                {perksByDay.length ? (
+                  perksByDay.map(([day, entries]) => (
+                    <div className="perk-day" key={day}>
+                      <h3>
+                        {new Date(`${day}T12:00:00`).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}
+                        <span>{money(entries.reduce((sum, s) => sum + ownersPerkValue(s), 0))}</span>
+                      </h3>
+                      {entries.map((s) => (
+                        <div className="sale-row" key={s.id}>
+                          <span className="sale-icon">OP</span>
+                          <span>
+                            <strong>{s.items.map((item) => `${item.quantity} x ${item.name}`).join(", ")}</strong>
+                            <small>{new Date(s.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })} - {s.staff}</small>
+                          </span>
+                          <strong>{money(ownersPerkValue(s))}</strong>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  ))
+                ) : (
+                  <div className="empty-report">No Owner&apos;s Perks in the last 14 days.</div>
+                )}
               </article>
             </div>
-            <article className="report-card owners-perks-log">
-              <div className="section-title"><h2>Owner&apos;s Perks</h2><span>{todayOwnersPerks.length} today</span></div>
-              {todayOwnersPerks.length ? todayOwnersPerks.map((s)=><div className="sale-row" key={s.id}><span className="sale-icon">OP</span><span><strong>{s.items.map(item=>`${item.quantity} x ${item.name}`).join(", ")}</strong><small>{new Date(s.at).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})} - {s.staff} - stock removed, no charge</small></span><strong>{money(ownersPerkValue(s))} value</strong></div>):<div className="empty-report">No Owner&apos;s Perks recorded today.</div>}
+            <article className="report-card">
+              <div className="section-title"><h2>Recent sales</h2><span>Refund tools</span></div>
+              {refundNotice && <p className="cash-instruction">{refundNotice}</p>}
+              {sales.slice(0, 20).map((s) => (
+                <div className="admin-sale" key={s.id}>
+                  <span>
+                    <strong>{money(s.method === "Owner's Perk" ? ownersPerkValue(s) : s.total)} · {s.method}</strong>
+                    <small>{s.staff} · {new Date(s.at).toLocaleString("en-GB")}</small>
+                  </span>
+                  <button disabled={s.refunded || Boolean(refundingId)} onClick={() => void refundSale(s)}>
+                    {s.refunded ? "Refunded" : refundingId === s.id ? "Refunding..." : "Refund"}
+                  </button>
+                </div>
+              ))}
+              {!sales.length && <div className="empty-report">No sales yet.</div>}
             </article>
           </section>
         )}
@@ -1138,9 +1634,8 @@ export default function Home() {
           <AdminPanel
             products={products}
             setProducts={setProducts}
-            sales={sales}
-            setSales={setSales}
             currentStaff={staff.name}
+            openNewProduct={startNewFromCode}
           />
         )}
       </section>
@@ -1290,7 +1785,17 @@ export default function Home() {
 
       {editing && (
         <div className="modal-backdrop">
-          <form className="edit-modal" onSubmit={saveProduct}>
+          <form
+            className="edit-modal"
+            onSubmit={saveProduct}
+            onKeyDown={(e) => {
+              // A scanner finishes its burst with Enter, which used to submit
+              // the half-filled form and close it. Enter in a field does
+              // nothing now - only the Save button saves.
+              const target = e.target as HTMLElement;
+              if (e.key === "Enter" && target.tagName === "INPUT") e.preventDefault();
+            }}
+          >
             <button
               type="button"
               className="modal-close"
@@ -1305,6 +1810,27 @@ export default function Home() {
                 : "Add new product"}
             </h2>
             <div className="form-grid">
+              <label className={`wide barcode-field${editing.barcode?.trim() ? " filled" : ""}`}>
+                Barcode
+                <input
+                  inputMode="numeric"
+                  value={editing.barcode || ""}
+                  onChange={(e) =>
+                    setEditing({ ...editing, barcode: e.target.value, quick: e.target.value.trim() ? false : editing.quick })
+                  }
+                  placeholder="Scan or type - leave empty for till-button items"
+                />
+                {(editing.altBarcodes || []).length > 0 && (
+                  <span className="alias-chips">
+                    {(editing.altBarcodes || []).map((code) => (
+                      <em key={code}>
+                        {code}
+                        <button type="button" aria-label={`Remove barcode ${code}`} onClick={() => setEditing({ ...editing, altBarcodes: (editing.altBarcodes || []).filter((c) => c !== code) })}>×</button>
+                      </em>
+                    ))}
+                  </span>
+                )}
+              </label>
               <label className="wide">
                 Product name
                 <input
@@ -1313,6 +1839,7 @@ export default function Home() {
                   onChange={(e) =>
                     setEditing({ ...editing, name: e.target.value })
                   }
+                  placeholder="Newgate Strawberry Trifle or similar"
                 />
               </label>
               <label>
@@ -1320,65 +1847,69 @@ export default function Home() {
                 <input
                   required
                   type="number"
+                  inputMode="decimal"
                   min="0.01"
                   step="0.01"
                   value={editing.price || ""}
                   onChange={(e) =>
                     setEditing({ ...editing, price: Number(e.target.value) })
                   }
+                  placeholder="£"
                 />
               </label>
               <label>
-                Unit cost
+                Cost price
                 <input
                   type="number"
+                  inputMode="decimal"
                   min="0"
                   step="0.01"
                   value={editing.cost || ""}
                   onChange={(e) =>
                     setEditing({ ...editing, cost: Number(e.target.value) })
                   }
+                  placeholder="£"
                 />
               </label>
               {editing.cost > 0 && <div className="pricing-advice wide">
-                <span>Recommended minimum <strong>{money(recommendedPrice(editing.cost))}</strong></span>
-                <button type="button" onClick={() => setEditing({ ...editing, price: recommendedPrice(editing.cost) })}>Use recommended price</button>
-                <span>Profit per unit <strong>{money(editing.price - editing.cost)}</strong></span>
-                <span>Markup <strong>{(((editing.price - editing.cost) / editing.cost) * 100).toFixed(1)}%</strong></span>
-                {editing.price < editing.cost * 1.3 && <em>Below the 30% recommendation</em>}
+                <span>Min {money(recommendedPrice(editing.cost, targetMargin))}</span>
+                <span>Profit {money(editing.price - editing.cost)}</span>
+                <span>Markup {Math.round(((editing.price - editing.cost) / editing.cost) * 100)}%</span>
+                {editing.price > 0 && editing.price < editing.cost * (1 + targetMargin / 100) && <em>Below the {targetMargin}% minimum</em>}
               </div>}
-              <StockStepper
-                label="Stock quantity"
-                value={editing.stock}
-                onChange={(stock) => setEditing({ ...editing, stock })}
-              />
-              <label>
-                Full shelf quantity <small>How many when fully stocked</small>
+              <label className="toggle-row wide">
                 <input
-                  type="number"
-                  min="0"
-                  inputMode="numeric"
-                  value={editing.full ?? ""}
-                  onChange={(e) => setEditing({ ...editing, full: e.target.value === "" ? undefined : Math.max(0, Number(e.target.value)) })}
-                  placeholder="e.g. 3"
+                  type="checkbox"
+                  checked={Boolean(editing.noStockCount)}
+                  onChange={(e) => setEditing({ ...editing, noStockCount: e.target.checked || undefined })}
                 />
+                Don&apos;t count stock for this item (loose things like bananas, served coffee, cakes)
               </label>
+              {!editing.noStockCount && (
+                <>
+                  <StockStepper
+                    label="Quantity in shop"
+                    value={editing.stock}
+                    onChange={(stock) => setEditing({ ...editing, stock })}
+                  />
+                  <label>
+                    Full shelf quantity <small>How many when fully stocked</small>
+                    <input
+                      type="number"
+                      min="0"
+                      inputMode="numeric"
+                      value={editing.full ?? ""}
+                      onChange={(e) => setEditing({ ...editing, full: e.target.value === "" ? undefined : Math.max(0, Number(e.target.value)) })}
+                      placeholder="e.g. 3"
+                    />
+                  </label>
+                </>
+              )}
+              <SupplierField value={editing.supplier || ""} options={supplierOptions} onChange={(supplier) => setEditing({ ...editing, supplier })} />
               <label>Category<select value={categories.includes(editing.category) ? editing.category : "__new"} onChange={(e) => setEditing({...editing, category:e.target.value === "__new" ? "" : e.target.value})}>{categories.filter(item=>item!=="Most popular"&&item!=="All products").map(item=><option key={item} value={item}>{item}</option>)}<option value="__new">Add new category...</option></select>{!categories.includes(editing.category)&&<input autoFocus value={editing.category} onChange={e=>setEditing({...editing,category:e.target.value})} placeholder="New category name"/>}</label>
               <label>
                 Size / variant
                 <input value={editing.size || ""} onChange={(e) => setEditing({ ...editing, size: e.target.value })} placeholder="e.g. 330ml, Large, Whole" />
-              </label>
-              <SupplierField value={editing.supplier || ""} options={supplierOptions} onChange={(supplier) => setEditing({ ...editing, supplier })} />
-
-              <label className="wide">
-                Barcode
-                <input
-                  value={editing.barcode || ""}
-                  onChange={(e) =>
-                    setEditing({ ...editing, barcode: e.target.value, quick: e.target.value.trim() ? false : editing.quick })
-                  }
-                  placeholder="Scan or type barcode"
-                />
               </label>
               <label className="toggle-row wide">
                 <input
@@ -1390,38 +1921,46 @@ export default function Home() {
                 />
                 Show as a till button
               </label>
-              <label className="toggle-row wide"><input type="checkbox" checked={Boolean(editing.keyProduct)} onChange={e=>setEditing({...editing,keyProduct:e.target.checked})}/>Key product — buy only from its usual supplier</label>
-              <label>
-                Case / multipack barcode
-                <input
-                  value={editing.caseBarcode || ""}
-                  onChange={(e) =>
-                    setEditing({ ...editing, caseBarcode: e.target.value })
-                  }
-                  placeholder="Scan the outer pack"
-                />
-              </label>
-              <label>
-                Sale units in case
-                <input
-                  type="number"
-                  min="1"
-                  value={editing.caseQuantity || ""}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      caseQuantity: Number(e.target.value) || undefined,
-                    })
-                  }
-                  placeholder="e.g. 24"
-                  disabled={!editing.caseBarcode?.trim()}
-                />
-              </label>
-              {editing.caseBarcode?.trim()&&!editing.caseQuantity&&<p className="wide field-help">Enter the number of sale units in this case. Until then, a case scan would add one unit.</p>}
               <label className="wide">
                 Notes
                 <input value={editing.notes || ""} onChange={(e) => setEditing({ ...editing, notes: e.target.value })} placeholder="Anything useful when buying or counting" />
               </label>
+              {products.some((p) => p.id === editing.id) && (
+                <details className="wide more-options">
+                  <summary>More options</summary>
+                  <div className="form-grid">
+                    <label className="toggle-row wide"><input type="checkbox" checked={Boolean(editing.keyProduct)} onChange={e=>setEditing({...editing,keyProduct:e.target.checked})}/>Key product — buy only from its usual supplier</label>
+                    <label>
+                      Case / multipack barcode
+                      <input
+                        inputMode="numeric"
+                        value={editing.caseBarcode || ""}
+                        onChange={(e) =>
+                          setEditing({ ...editing, caseBarcode: e.target.value })
+                        }
+                        placeholder="Scan the outer pack"
+                      />
+                    </label>
+                    <label>
+                      Sale units in case
+                      <input
+                        type="number"
+                        min="1"
+                        value={editing.caseQuantity || ""}
+                        onChange={(e) =>
+                          setEditing({
+                            ...editing,
+                            caseQuantity: Number(e.target.value) || undefined,
+                          })
+                        }
+                        placeholder="e.g. 24"
+                        disabled={!editing.caseBarcode?.trim()}
+                      />
+                    </label>
+                    {editing.caseBarcode?.trim()&&!editing.caseQuantity&&<p className="wide field-help">Enter the number of sale units in this case. Until then, a case scan would add one unit.</p>}
+                  </div>
+                </details>
+              )}
             </div>
             <div className="product-edit-actions">
               {products.some((product) => product.id === editing.id) && <button type="button" className="danger-button" onClick={deleteProduct}>Delete product</button>}

@@ -47,15 +47,14 @@ state.products = live.products;
 if (live.suppliers) state.suppliers = live.suppliers;
 if (live.settings) state.settings = live.settings;
 if (live.team) state.team = live.team;
-// Placements live on the product records, so a pull wipes them. The trolley
-// belongs to a shopping trip, not to the catalogue.
+// The shop map feature was removed in Sep 2026 - drop its leftovers.
 delete state.walk_picked;
+delete state.shop_layout;
 writeFileSync(file, JSON.stringify(state, null, 2));
 
 const gaps = (test) => live.products.filter(test).length;
 console.log(`backup: store-state.backup-${stamp}.json`);
 console.log(`products ${before} -> ${state.products.length}`);
-console.log(`shop map kept: ${state.shop_layout?.fixtures?.length || 0} bays`);
 console.log("");
 console.log("catalogue gaps on live:");
 console.log(`  no cost price   ${gaps((p) => !(p.cost > 0))}`);

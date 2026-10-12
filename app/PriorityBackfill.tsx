@@ -1,12 +1,13 @@
 "use client";
 import { useMemo, useRef, useState } from "react";
-import { deleteProductNow, saveProductNow } from "./live-store";
+import { deleteProductNow, saveProductNow, type StockChange } from "./live-store";
 
 type Product = {
   id: string; name: string; price: number; cost: number; stock: number; category: string;
   full?: number; lowStockLevel?: number; barcode?: string; caseBarcode?: string; caseQuantity?: number;
   colour: string; quick?: boolean; supplier?: string; size?: string; notes?: string;
   keyProduct?: boolean; stockConfirmed?: boolean; backfillSkipped?: boolean; tillSetupConfirmed?: boolean; discontinued?: boolean;
+  noStockCount?: boolean;
 };
 
 const baseSuppliers = ["Lidl", "Iceland", "Home Bargains", "Heron", "Bates", "Tesco", "Tomlins", "Yodeyma", "Costco"];
@@ -18,7 +19,8 @@ const gaps = (p: Product) => ({
   price: !(p.price > 0),
   cost: !(p.cost > 0),
   supplier: !txt(p.supplier),
-  full: !(typeof p.full === "number" && p.full > 0),
+  // A product whose stock isn't counted has no shelf target to chase.
+  full: !p.noStockCount && !(typeof p.full === "number" && p.full > 0),
 });
 const isComplete = (p: Product) => { if (p.discontinued) return true; const g = gaps(p); return !g.price && !g.cost && !g.supplier && !g.full; };
 // A product with neither a barcode nor a till button can never reach the till.
@@ -111,7 +113,9 @@ export function PriorityBackfill({
     const p = productsRef.current.find((x) => x.id === id);
     const patch = pendingRef.current[id];
     if (!p || !patch || patch.stock === undefined || patch.stock === p.stock) { clearPending(id); return; }
-    persist({ ...p, ...patch } as Product)
+    // Send the CHANGE the taps made, not the resulting number - the server
+    // applies it to its own live count, so a sale landing mid-tap is kept.
+    persist({ ...p, ...patch } as Product, undefined, { delta: patch.stock - p.stock })
       .then(() => clearPending(id))
       .catch((err) => setNotice(err instanceof Error ? err.message : "Could not save stock"));
   };
@@ -130,9 +134,10 @@ export function PriorityBackfill({
     scheduleStock(p.id);
   };
 
-  // Save a full product record and refresh the shared catalogue.
-  const persist = async (next: Product, flash?: string) => {
-    const saved = await saveProductNow({ ...next, name: (next.name || "").trim() } as unknown as Record<string, unknown>) as unknown as Product[];
+  // Save a full product record and refresh the shared catalogue. The server
+  // keeps its own stock figure unless a deliberate stock change is passed.
+  const persist = async (next: Product, flash?: string, stock?: StockChange) => {
+    const saved = await saveProductNow({ ...next, name: (next.name || "").trim() } as unknown as Record<string, unknown>, stock) as unknown as Product[];
     setProducts(saved);
     if (flash) setNotice(flash);
     return saved;
@@ -155,7 +160,11 @@ export function PriorityBackfill({
       return;
     }
     setBusy(p.id);
-    try { await persist(next, `${next.name || "Product"} saved`); clearPending(p.id); }
+    try {
+      const stockChange = typeof patch.stock === "number" && patch.stock !== p.stock ? { delta: patch.stock - p.stock } : undefined;
+      await persist(next, `${next.name || "Product"} saved`, stockChange);
+      clearPending(p.id);
+    }
     catch (err) { setNotice(err instanceof Error ? err.message : "Could not save"); }
     finally { setBusy(null); }
   };
@@ -180,7 +189,10 @@ export function PriorityBackfill({
     )) return;
     setBusy(keepId);
     try {
-      let saved = await persist({ ...keep, stock: totalStock });
+      // Add the duplicates' stock ONTO the kept record's live server count, so
+      // a sale landing mid-merge is not lost.
+      const spareStock = others.reduce((s, p) => s + (Number(p.stock) || 0), 0);
+      let saved = await persist({ ...keep }, undefined, spareStock > 0 ? { delta: spareStock } : undefined);
       for (const o of others) saved = await deleteProductNow(o.id) as unknown as Product[];
       setProducts(saved);
       setNotice(`Merged into "${keep.name}" (stock ${totalStock})`);

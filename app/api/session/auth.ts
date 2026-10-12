@@ -24,5 +24,19 @@ export async function verifyStaffSession(request: Request) {
   return Boolean(supplied && expires > Date.now() && supplied === await signature(payload));
 }
 
+// The signed-in staff member's name, taken from the same signed cookie the
+// session check uses - so the stock movement log records who really made a
+// change, not whatever a screen claims. Returns "" for an invalid session.
+export async function staffFromSession(request: Request) {
+  const cookie = request.headers.get("cookie")?.split(";").map(v=>v.trim()).find(v=>v.startsWith(`${COOKIE_NAME}=`))?.slice(COOKIE_NAME.length+1);
+  if (!cookie) return "";
+  const [encoded, supplied] = cookie.split(".");
+  const payload = decodeURIComponent(encoded || "");
+  const parts = payload.split(":");
+  const expires = Number(parts.at(-1));
+  if (!(supplied && expires > Date.now() && supplied === await signature(payload))) return "";
+  return parts.slice(0, -1).join(":");
+}
+
 export const staffCookie = (value: string, maxAge = 43200) =>
   `${COOKIE_NAME}=${value}; Path=/; HttpOnly${process.env.NODE_ENV === "production" ? "; Secure" : ""}; SameSite=Strict; Max-Age=${maxAge}`;

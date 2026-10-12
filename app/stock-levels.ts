@@ -7,7 +7,7 @@
 
 export const DEFAULT_LOW_STOCK_LEVEL = 1;
 
-type StockLike = { stock: number; full?: number; lowStockLevel?: number };
+type StockLike = { stock: number; full?: number; lowStockLevel?: number; noStockCount?: boolean };
 
 // The stock count at or below which a product counts as low.
 export function lowStockLevelFor(product: StockLike): number {
@@ -17,5 +17,7 @@ export function lowStockLevelFor(product: StockLike): number {
 }
 
 export function isLowStock(product: StockLike): boolean {
+  // A product whose stock is not counted can never be "low".
+  if (product.noStockCount) return false;
   return product.stock <= lowStockLevelFor(product);
 }
