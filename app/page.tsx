@@ -48,6 +48,9 @@ type CartLine = { product: Product; quantity: number; price?: number };
 // What this line actually sells for: the override if one was typed in at the
 // till, otherwise the shelf price.
 const linePrice = (line: CartLine) => (typeof line.price === "number" ? line.price : line.product.price);
+const dayKeyOf = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const checkDaysFrom = (raw: unknown): string[] =>
+  Array.isArray(raw) ? (raw as { date?: unknown }[]).map((c) => c?.date).filter((d): d is string => typeof d === "string") : [];
 type PaymentMethod = "Cash" | "Card" | "Split";
 type TransactionMethod = PaymentMethod | "Owner's Perk" | "Waste";
 type Sale = {
@@ -136,6 +139,10 @@ export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
   const [yodeymaOrders, setYodeymaOrders] = useState<YodeymaOrder[]>([]);
+  // Days that have a fridge check (or are marked closed), so the till can
+  // insist on today's check from the moment someone signs in.
+  const [checkedDays, setCheckedDays] = useState<string[] | null>(null);
+  const [checkPromptOpen, setCheckPromptOpen] = useState(false);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [category, setCategory] = useState("Most popular");
   const [search, setSearch] = useState("");
@@ -255,12 +262,42 @@ export default function Home() {
       setProducts(Array.isArray(live.products) ? live.products as Product[] : []);
       setSales(Array.isArray(live.sales) ? live.sales as Sale[] : []);
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
+      setCheckedDays(checkDaysFrom(live.daily_checks));
+      setCheckPromptOpen(true);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
       setHydrated(true);
       writeCachedCatalogue(live.products);
     })();
   }, [staff]);
+  // Leaving the Daily checks page: re-read the checks at once, so the notice
+  // disappears the moment today's check is saved rather than a minute later.
+  useEffect(() => {
+    if (!staff || view === "checks") return;
+    let cancelled = false;
+    void (async () => {
+      const live = await loadLiveState();
+      if (!cancelled && live.daily_checks !== undefined) setCheckedDays(checkDaysFrom(live.daily_checks));
+    })();
+    return () => { cancelled = true; };
+  }, [view, staff]);
+  const checkToday = todayKey();
+  const isSunday = new Date().getDay() === 0;
+  // Earlier days in the last fortnight with nothing recorded (Sundays are
+  // closed days and never count), but never before the first check existed.
+  const missedEarlier = (() => {
+    if (!checkedDays || !checkedDays.length) return 0;
+    const earliest = checkedDays.reduce((a, b) => (a < b ? a : b));
+    let n = 0;
+    for (let back = 1; back <= 14; back += 1) {
+      const d = new Date(Date.now() - back * 86400000);
+      const k = dayKeyOf(d);
+      if (k < earliest) break;
+      if (d.getDay() !== 0 && !checkedDays.includes(k)) n += 1;
+    }
+    return n;
+  })();
+  const checkDueToday = checkedDays !== null && !isSunday && !checkedDays.includes(checkToday);
   // Keep the head start current as stock moves through the day.
   useEffect(() => {
     if (hydrated) writeCachedCatalogue(products);
@@ -280,6 +317,7 @@ export default function Home() {
       if (cancelled || pendingWrites.current > 0) return;
       if (Array.isArray(live.products)) setProducts(live.products as Product[]);
       if (Array.isArray(live.sales)) setSales(live.sales as Sale[]);
+      setCheckedDays(checkDaysFrom(live.daily_checks));
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
     };
@@ -1175,6 +1213,23 @@ export default function Home() {
             </div>
           )}
         </header>
+        {checkDueToday && view !== "checks" && (
+          <button type="button" className="check-due-banner" onClick={() => setView("checks")}>
+            <strong>⚠ Today&apos;s fridge check hasn&apos;t been done</strong>
+            <span>Tap here to do it now{missedEarlier ? ` - and ${missedEarlier === 1 ? "1 earlier day is" : `${missedEarlier} earlier days are`} missing` : ""}</span>
+          </button>
+        )}
+        {checkDueToday && checkPromptOpen && view !== "checks" && (
+          <div className="modal-backdrop check-due-backdrop">
+            <div className="check-due-modal" role="alertdialog" aria-labelledby="check-due-title">
+              <p className="eyebrow">Food safety</p>
+              <h2 id="check-due-title">Today&apos;s fridge check hasn&apos;t been done</h2>
+              <p>Please do it straight away - fridge and freezer temperatures, and the date check.{missedEarlier ? ` ${missedEarlier === 1 ? "1 earlier day is" : `${missedEarlier} earlier days are`} also missing.` : ""}</p>
+              <button type="button" className="pay-button" onClick={() => { setCheckPromptOpen(false); setView("checks"); }}>Do the fridge check now</button>
+              <button type="button" className="cash-shortcut" onClick={() => setCheckPromptOpen(false)}>Serving a customer - I&apos;ll do it next</button>
+            </div>
+          </div>
+        )}
         {notice && (
           <div className="notice" role="status">
             {notice}
