@@ -19,6 +19,14 @@ type Product = { id: string; stock: number; name?: string; [key: string]: unknow
 // exactly what the flag was asking for, so it clears.
 type Change = { id: string; delta?: number; set?: number; keepRecount?: boolean };
 
+// Adding stock always adds to the real figure, even when it is below zero
+// (sold before the delivery was entered). Taking stock away by hand never
+// pushes a count below zero on its own.
+function nextAfterDelta(current: number, delta: number) {
+  if (delta >= 0) return current + delta;
+  return Math.max(Math.min(current, 0), current + delta);
+}
+
 function applyChanges(products: Product[], changes: Change[], staff: string, reason: string) {
   const byId = new Map(products.map((product) => [product.id, product]));
   const missing: string[] = [];
@@ -34,7 +42,7 @@ function applyChanges(products: Product[], changes: Change[], staff: string, rea
     const current = Number(product.stock) || 0;
     const next = typeof change.set === "number"
       ? Math.max(0, Math.floor(change.set))
-      : Math.max(0, current + Math.floor(change.delta || 0));
+      : nextAfterDelta(current, Math.floor(change.delta || 0));
     const updated: Product = { ...product, stock: next };
     if (!change.keepRecount) delete updated.recount;
     byId.set(change.id, updated);

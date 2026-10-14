@@ -36,7 +36,10 @@ function applySale(products: Product[], sales: Sale[], sale: Sale, items: Item[]
       const quantity = requested.get(product.id);
       if (!quantity) return product;
       const short = product.stock < quantity;
-      const next: Product = { ...product, stock: Math.max(0, product.stock - quantity) };
+      // The count is allowed to go below zero: something sold before its
+      // delivery was entered shows as -1, so adding the full delivery later
+      // lands on the true shelf number instead of one too many.
+      const next: Product = { ...product, stock: product.stock - quantity };
       if (short) next.recount = true;
       movements.push(movement(staff, reason, product, product.stock, next.stock));
       return next;

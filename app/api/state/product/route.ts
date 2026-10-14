@@ -20,7 +20,12 @@ function mergeProduct(products: Product[], product: Product, stock: StockChange 
   const existing = products.find((candidate) => candidate.id === product.id);
   const applyStock = (current: number) => {
     if (typeof stock?.set === "number") return Math.max(0, Math.floor(stock.set));
-    if (typeof stock?.delta === "number") return Math.max(0, current + Math.floor(stock.delta));
+    if (typeof stock?.delta === "number") {
+      // Same rule as the stock route: additions land on the real (possibly
+      // below-zero) figure; a manual decrease never goes below zero by itself.
+      const delta = Math.floor(stock.delta);
+      return delta >= 0 ? current + delta : Math.max(Math.min(current, 0), current + delta);
+    }
     return current;
   };
   const movements: Movement[] = [];

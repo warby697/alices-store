@@ -414,7 +414,7 @@ export default function Home() {
       return [...current, { product, quantity: 1 }];
     });
     if (beyondStock) {
-      setNotice(`${product.name} added - stock showed ${product.stock}, so the shelf will be flagged for a recount`);
+      setNotice(`${product.name} added - stock showed ${Math.max(0, product.stock)}, so the shelf will be flagged for a recount`);
       speak(`${product.name}, ${money(product.price)}. Stock count needs checking.`);
     } else {
       setNotice(`${product.name} added`);
@@ -428,7 +428,7 @@ export default function Home() {
         if (line.product.id !== id) return line;
         const quantity = line.quantity + delta;
         if (delta > 0 && !line.product.noStockCount && quantity > line.product.stock)
-          setNotice(`Stock showed ${line.product.stock} ${line.product.name} - selling anyway, shelf will be flagged for a recount`);
+          setNotice(`Stock showed ${Math.max(0, line.product.stock)} ${line.product.name} - selling anyway, shelf will be flagged for a recount`);
         return { ...line, quantity };
       })
       .filter((line) => line.quantity > 0));
@@ -792,7 +792,7 @@ export default function Home() {
     };
     setSales((current) => [transaction, ...current]);
     const counted = !product.noStockCount;
-    if (counted) setProducts((current) => current.map((p) => (p.id === product.id ? { ...p, stock: Math.max(0, p.stock - 1) } : p)));
+    if (counted) setProducts((current) => current.map((p) => (p.id === product.id ? { ...p, stock: p.stock - 1 } : p)));
     setRestockNotice(`1 written off - tap again for each one binned`);
     pendingWrites.current += 1;
     void (async () => {
@@ -1189,7 +1189,7 @@ export default function Home() {
                     <div className="product-info">
                       <strong>{product.name}</strong>
                       {product.size && <small>{product.size}</small>}
-                      {!product.noStockCount && <span>{product.stock} in stock</span>}
+                      {!product.noStockCount && <span>{Math.max(0, product.stock)} in stock</span>}
                       {!product.noStockCount && (product.stock <= 0 ? <b>Shows 0 - still sells</b> : isLowStock(product) && <b>Low stock</b>)}
                     </div>
                     <em>{money(product.price)}</em>
@@ -1347,7 +1347,7 @@ export default function Home() {
                       {aliasSearch.trim() && matches.map((p) => (
                         <button type="button" key={p.id} onClick={() => void addAliasTo(p, unknownCode)}>
                           <strong>{p.name}</strong>
-                          <small>{money(p.price)}{p.noStockCount ? "" : ` · ${p.stock} in stock`}</small>
+                          <small>{money(p.price)}{p.noStockCount ? "" : ` · ${Math.max(0, p.stock)} in stock`}</small>
                         </button>
                       ))}
                     </div>
@@ -1376,6 +1376,9 @@ export default function Home() {
                           <div className="restock-count">
                             <b>{scanned.stock + restockPendingView}</b>
                             <small>in stock{restockAdded ? ` · ${restockAdded > 0 ? "+" : ""}${restockAdded} just now` : ""}</small>
+                            {scanned.stock + restockPendingView < 0 && (
+                              <small className="restock-minus">Sold before it was entered - add the delivery and it comes right</small>
+                            )}
                           </div>
                           <button type="button" aria-label="One more in stock" onClick={() => adjustRestock(scanned.id, 1)}>+</button>
                         </div>
@@ -1428,9 +1431,10 @@ export default function Home() {
               };
               const confirmRight = async (p: Product) => {
                 try {
-                  const saved = await adjustStockNow([{ id: p.id, delta: 0 }], { reason: "count" });
+                  const confirmed = Math.max(0, p.stock);
+                  const saved = await adjustStockNow([{ id: p.id, set: confirmed }], { reason: "count" });
                   setProducts(saved.products as unknown as Product[]);
-                  setNotice(`${p.name}: count confirmed at ${p.stock}`);
+                  setNotice(`${p.name}: count confirmed at ${confirmed}`);
                 } catch (error) {
                   setNotice(error instanceof Error ? `NOT SAVED: ${error.message}` : "NOT SAVED - please try again");
                 }
@@ -1441,8 +1445,8 @@ export default function Home() {
                   <small>The till sold these while the screen said 0. Count the shelf, tap the name and put the real number in - or tick if the number showing is already right.</small>
                   {flagged.map((p) => (
                     <div className="recount-row" key={p.id}>
-                      <button type="button" onClick={() => openOnCard(p)}><strong>{p.name}</strong><small>shows {p.stock} in stock</small></button>
-                      <button type="button" className="recount-ok" onClick={() => void confirmRight(p)}>✓ {p.stock} is right</button>
+                      <button type="button" onClick={() => openOnCard(p)}><strong>{p.name}</strong><small>shows {Math.max(0, p.stock)} in stock</small></button>
+                      <button type="button" className="recount-ok" onClick={() => void confirmRight(p)}>✓ {Math.max(0, p.stock)} is right</button>
                     </div>
                   ))}
                 </div>

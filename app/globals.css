@@ -915,6 +915,7 @@ select:focus-visible {
 .restock-count { text-align: center; min-width: 5.5rem; }
 .restock-count b { display: block; font-size: 2.1rem; line-height: 1.1; }
 .restock-count small { color: #14463a; font-weight: 600; font-size: 0.8rem; }
+.restock-count small.restock-minus { display: block; margin-top: 0.25rem; color: #8a5a12; font-size: 0.7rem; }
 .restock-side { display: flex; flex-direction: column; gap: 0.5rem; }
 .restock-side button {
   border: 1px solid var(--line);
