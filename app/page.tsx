@@ -554,6 +554,11 @@ export default function Home() {
       return;
     }
     setUnknownCode(null);
+    // Every scan on the Stock page is written to the movement log as "checked",
+    // even when the count needs no change - otherwise "scanned and right" and
+    // "never scanned" look identical, and a stock check can't tell what was
+    // missed. It moves no stock and leaves any recount flag alone.
+    void adjustStockNow([{ id: product.id, delta: 0 }], { keepRecount: true, reason: "check" }).catch(() => {});
     if (restockId !== product.id) {
       // Different product: save anything still pending on the old one first.
       if (restockId && restockTimer.current) {
