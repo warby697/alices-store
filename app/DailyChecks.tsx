@@ -19,14 +19,19 @@ import { loadLiveState, saveLiveStateNow } from "./live-store";
 
 const UNITS = [
   { key: "main-fridge", name: "Main Fridge", freezer: false, min: -1, max: 6, ideal: "0–5°C" },
-  { key: "temp-fridge", name: "Temp Fridge", freezer: false, min: -1, max: 6, ideal: "0–5°C" },
+  // Holds no food, so it is allowed up to 8°C (owner's decision, 14 Oct 2026).
+  { key: "temp-fridge", name: "Temp Fridge", freezer: false, min: -1, max: 8, ideal: "up to 8°C", note: "No food stored" },
   { key: "cake-fridge", name: "Cake Fridge", freezer: false, min: -1, max: 6, ideal: "0–5°C" },
-  { key: "staff-fridge", name: "Staff Fridge", freezer: false, min: -1, max: 6, ideal: "0–5°C" },
+  { key: "staff-fridge", name: "Staff Fridge", freezer: false, min: -1, max: 6, ideal: "0–5°C", note: "Staff use only - no food for customers" },
   { key: "main-freezer", name: "Main Freezer", freezer: true, min: -99, max: -17, ideal: "−18°C or colder" },
   { key: "ice-cream-freezer", name: "Ice Cream Freezer", freezer: true, min: -99, max: -17, ideal: "−18°C or colder" },
 ] as const;
 
-type UnitReading = { name: string; temp: number; ok: boolean; action?: string };
+type UnitReading = { name: string; temp: number; ok: boolean; action?: string; note?: string };
+const noteFor = (name: string): string | undefined => {
+  const unit = UNITS.find((u) => u.name === name) as { note?: string } | undefined;
+  return unit?.note;
+};
 type DailyCheck = {
   id: string;
   date: string; // the day this check covers (YYYY-MM-DD)
@@ -120,6 +125,7 @@ export function DailyChecks({ staff }: { staff: string }) {
           temp: row.value as number,
           ok: Boolean(row.ok),
           action: row.ok === false ? (actions[row.unit.key] || "").trim() : undefined,
+          note: "note" in row.unit ? row.unit.note : undefined,
         })),
         datesChecked: true,
       });
@@ -185,6 +191,7 @@ export function DailyChecks({ staff }: { staff: string }) {
             <div className="dc-unit-name">
               <strong>{unit.name}</strong>
               <small>{unit.ideal}</small>
+              {"note" in unit && <em className="dc-unit-note">{unit.note}</em>}
             </div>
             <label className="dc-temp">
               {unit.freezer && <b>−</b>}
@@ -264,6 +271,7 @@ export function DailyChecks({ staff }: { staff: string }) {
                   {check.units.map((u) => (
                     <span key={u.name} className={u.ok ? "" : "out"}>
                       {u.name} {u.temp}° {u.ok ? "✓" : "✗"}
+                      {(u.note || noteFor(u.name)) && <em className="dc-unit-note">({u.note || noteFor(u.name)})</em>}
                     </span>
                   ))}
                   <span className={check.datesChecked ? "" : "out"}>Dates {check.datesChecked ? "✓" : "✗"}</span>

@@ -771,6 +771,7 @@ select:focus-visible {
 .dc-unit.out { border-color: #a3352a; background: #fdf3f1; }
 .dc-unit-name { display: flex; align-items: baseline; gap: 0.45rem; flex-wrap: wrap; }
 .dc-unit-name small { color: #5c6763; }
+.dc-unit-note { font-style: normal; font-size: 0.72rem; font-weight: 700; color: #1d5a49; background: #e4efe8; border-radius: 0.35rem; padding: 0.05rem 0.4rem; margin-left: 0.3rem; }
 .dc-fordate {
   display: flex !important;
   flex-direction: row;
