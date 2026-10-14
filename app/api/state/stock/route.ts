@@ -36,7 +36,17 @@ function applyChanges(products: Product[], changes: Change[], staff: string, rea
     // A product deleted since the screen loaded: nothing to update. Report it
     // back rather than failing the whole batch (a daily count should still
     // save its other seven lines).
-    if (!product) { missing.push(change.id); continue; }
+    if (!product) {
+      // A Stock-page scan of a barcode that isn't in the catalogue arrives as
+      // "unknown:<code>". There is no stock to change, but the scan is still
+      // written to the log so every single scan leaves a record.
+      if (change.id.startsWith("unknown:") && (change.delta || 0) === 0) {
+        movements.push(movement(staff, reason, { id: change.id, name: `Unknown barcode ${change.id.slice(8)}` }, 0, 0));
+        continue;
+      }
+      missing.push(change.id);
+      continue;
+    }
     // Stock is not counted for this product - nothing to change or log.
     if (product.noStockCount) continue;
     const current = Number(product.stock) || 0;

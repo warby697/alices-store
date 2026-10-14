@@ -167,6 +167,55 @@ export default function Home() {
   const [restockNotice, setRestockNotice] = useState("");
   const restockPending = useRef(0);
   const restockTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Every scan on the Stock page is logged as "checked" - including scans
+  // where the count needs no change, and barcodes the system doesn't know.
+  // Scans queue on the device (so a rapid burst, a dropped signal or a page
+  // closed mid-send can't lose one), go to the server in batches, and leave
+  // the queue only once the server has confirmed them.
+  const scanQueue = useRef<string[]>([]);
+  const scanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanSending = useRef(false);
+  const SCAN_QUEUE_KEY = "alices-store.scan-checks.v1";
+  const saveScanQueue = () => {
+    try { localStorage.setItem(SCAN_QUEUE_KEY, JSON.stringify(scanQueue.current)); } catch { /* storage full or blocked */ }
+  };
+  const flushScans = async () => {
+    if (scanSending.current || !scanQueue.current.length) return;
+    scanSending.current = true;
+    const batch = scanQueue.current.slice(0, 150);
+    try {
+      await adjustStockNow(batch.map((id) => ({ id, delta: 0 })), { keepRecount: true, reason: "check" });
+      scanQueue.current = scanQueue.current.slice(batch.length);
+      saveScanQueue();
+    } catch {
+      // No signal or a busy server: keep them and try again shortly.
+      if (scanTimer.current) clearTimeout(scanTimer.current);
+      scanTimer.current = setTimeout(() => void flushScans(), 5000);
+    } finally {
+      scanSending.current = false;
+    }
+    if (scanQueue.current.length) {
+      if (scanTimer.current) clearTimeout(scanTimer.current);
+      scanTimer.current = setTimeout(() => void flushScans(), 1200);
+    }
+  };
+  const logScan = (id: string) => {
+    scanQueue.current.push(id);
+    saveScanQueue();
+    if (scanTimer.current) clearTimeout(scanTimer.current);
+    scanTimer.current = setTimeout(() => void flushScans(), 1200);
+  };
+  // Anything left on the device from last time (closed tab, lost signal) goes now.
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SCAN_QUEUE_KEY) || "[]");
+      if (Array.isArray(saved) && saved.length) {
+        scanQueue.current = saved.filter((x: unknown): x is string => typeof x === "string");
+        scanTimer.current = setTimeout(() => void flushScans(), 2000);
+      }
+    } catch { /* nothing saved */ }
+    return () => { if (scanTimer.current) clearTimeout(scanTimer.current); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   // An unknown barcode on the Stock page: hold it while staff choose between
   // "new product" and "another barcode for something we already sell".
   const [unknownCode, setUnknownCode] = useState<string | null>(null);
@@ -545,6 +594,7 @@ export default function Home() {
   const restockScan = (code: string) => {
     const product = products.find((candidate) => ownsBarcode(candidate, code) || (candidate.caseBarcode && candidate.caseBarcode === code));
     if (!product) {
+      logScan(`unknown:${code}`);
       // Not in the catalogue: could be a genuinely new product, or the same
       // shelf item bought from a different shop with a different barcode
       // (bleach is bleach). Staff choose on the card.
@@ -558,7 +608,7 @@ export default function Home() {
     // even when the count needs no change - otherwise "scanned and right" and
     // "never scanned" look identical, and a stock check can't tell what was
     // missed. It moves no stock and leaves any recount flag alone.
-    void adjustStockNow([{ id: product.id, delta: 0 }], { keepRecount: true, reason: "check" }).catch(() => {});
+    logScan(product.id);
     if (restockId !== product.id) {
       // Different product: save anything still pending on the old one first.
       if (restockId && restockTimer.current) {
