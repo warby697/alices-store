@@ -42,7 +42,7 @@ export async function PUT(request: Request) {
       // Allows camelCase: the app has always saved the basket as "shoppingBasket",
       // which the old lowercase-only rule quietly rejected in production.
       if (!/^[a-z][a-zA-Z0-9_-]{1,40}$/.test(key)) return Response.json({ error: "Invalid state key" }, { status: 400 });
-      if (key === "products" || key === "sales" || key === "stock_log") {
+      if (key === "products" || key === "sales" || key === "stock_log" || key === "till_days" || key === "sign_ins") {
         return Response.json({ error: `"${key}" cannot be saved wholesale - it only changes through its own locked routes` }, { status: 400 });
       }
     }

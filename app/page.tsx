@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { AdminPanel } from "./AdminPanel";
-import { CashDrawer } from "./CashDrawer";
+import { CloseShopForm, OpenShopPrompt, ShopDays, cashSalesOn, type TillDay } from "./ShopDay";
+import { StaffByDay } from "./StaffByDay";
 import { DailyChecks } from "./DailyChecks";
 import { PriorityBackfill } from "./PriorityBackfill";
 import { StockStepper } from "./StockStepper";
@@ -71,7 +72,6 @@ type Staff = {
   initials: string;
   accessible?: boolean;
   admin?: boolean;
-  dailyWage?: number;
 };
 
 const money = (value: number) =>
@@ -143,6 +143,10 @@ export default function Home() {
   // insist on today's check from the moment someone signs in.
   const [checkedDays, setCheckedDays] = useState<string[] | null>(null);
   const [checkPromptOpen, setCheckPromptOpen] = useState(false);
+  // Opening (£50 float) and closing (takings counted) the shop each day.
+  const [tillDays, setTillDays] = useState<TillDay[] | null>(null);
+  const [floatPromptOpen, setFloatPromptOpen] = useState(false);
+  const [signOutStep, setSignOutStep] = useState<null | "ask" | "close">(null);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [category, setCategory] = useState("Most popular");
   const [search, setSearch] = useState("");
@@ -270,6 +274,8 @@ export default function Home() {
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
       setCheckedDays(checkDaysFrom(live.daily_checks));
       setCheckPromptOpen(true);
+      setTillDays(Array.isArray(live.till_days) ? live.till_days as TillDay[] : []);
+      setFloatPromptOpen(true);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
       setHydrated(true);
@@ -304,6 +310,23 @@ export default function Home() {
     return n;
   })();
   const checkDueToday = checkedDays !== null && !isSunday && !checkedDays.includes(checkToday);
+  const todayTill = tillDays?.find((d) => d.date === checkToday);
+  // The first person in each day confirms the £50 float before anything else.
+  const floatDue = tillDays !== null && !isSunday && !todayTill?.openedAt;
+  const cashToday = cashSalesOn(sales, checkToday);
+  const signOutNow = () => {
+    void fetch("/api/session", { method: "DELETE" });
+    setSignOutStep(null);
+    setStaff(null);
+    setCart([]);
+  };
+  // Signing out while the shop is open for the day asks whether this is the
+  // closing sign-out; if it is, the cash is counted and balanced first.
+  const requestSignOut = () => {
+    const openToday = !todayTill?.closedAt && (Boolean(todayTill?.openedAt) || sales.some((x) => x.at && dayKeyOf(new Date(x.at)) === checkToday));
+    if (openToday && !isSunday) setSignOutStep("ask");
+    else signOutNow();
+  };
   // Keep the head start current as stock moves through the day.
   useEffect(() => {
     if (hydrated) writeCachedCatalogue(products);
@@ -324,6 +347,7 @@ export default function Home() {
       if (Array.isArray(live.products)) setProducts(live.products as Product[]);
       if (Array.isArray(live.sales)) setSales(live.sales as Sale[]);
       setCheckedDays(checkDaysFrom(live.daily_checks));
+      if (Array.isArray(live.till_days)) setTillDays(live.till_days as TillDay[]);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
     };
@@ -1146,11 +1170,7 @@ export default function Home() {
           <button
             className="mobile-logout"
             aria-label={`Sign out ${staff.name}`}
-            onClick={() => {
-              void fetch("/api/session", {method:"DELETE"});
-              setStaff(null);
-              setCart([]);
-            }}
+            onClick={requestSignOut}
           >
             Sign out
           </button>
@@ -1162,11 +1182,7 @@ export default function Home() {
         </div>
         <button
           className="staff-card"
-          onClick={() => {
-            void fetch("/api/session", {method:"DELETE"});
-            setStaff(null);
-            setCart([]);
-          }}
+          onClick={requestSignOut}
         >
           <span className="avatar">{staff.initials}</span>
           <span>
@@ -1219,7 +1235,32 @@ export default function Home() {
             <span>Tap here to do it now{missedEarlier ? ` - and ${missedEarlier === 1 ? "1 earlier day is" : `${missedEarlier} earlier days are`} missing` : ""}</span>
           </button>
         )}
-        {checkDueToday && checkPromptOpen && view !== "checks" && (
+        {floatDue && floatPromptOpen && (
+          <OpenShopPrompt
+            onOpened={(days) => { setTillDays(days); setFloatPromptOpen(false); }}
+            onLater={() => setFloatPromptOpen(false)}
+          />
+        )}
+        {signOutStep === "ask" && (
+          <div className="modal-backdrop check-due-backdrop">
+            <div className="check-due-modal shop-day-modal" role="alertdialog" aria-labelledby="closing-title">
+              <p className="eyebrow">Signing out</p>
+              <h2 id="closing-title">Are you closing the shop for today?</h2>
+              <p>If you are, you&apos;ll count the takings and leave the £50 float before signing out.</p>
+              <button type="button" className="pay-button" onClick={() => setSignOutStep("close")}>Yes - close up for today</button>
+              <button type="button" className="cash-shortcut" onClick={signOutNow}>No - just signing out</button>
+              <button type="button" className="cash-shortcut" onClick={() => setSignOutStep(null)}>Stay signed in</button>
+            </div>
+          </div>
+        )}
+        {signOutStep === "close" && (
+          <div className="modal-backdrop check-due-backdrop">
+            <div className="check-due-modal shop-day-modal">
+              <CloseShopForm cashSales={cashToday} finishLabel="Sign out" onClosed={(days) => { setTillDays(days); signOutNow(); }} onCancel={() => setSignOutStep("ask")} />
+            </div>
+          </div>
+        )}
+        {checkDueToday && checkPromptOpen && !(floatDue && floatPromptOpen) && view !== "checks" && (
           <div className="modal-backdrop check-due-backdrop">
             <div className="check-due-modal" role="alertdialog" aria-labelledby="check-due-title">
               <p className="eyebrow">Food safety</p>
@@ -1426,7 +1467,7 @@ export default function Home() {
             </aside>
           </div>
         )}
-        {view === "cash" && <CashDrawer sales={sales} staff={staff.name} dailyWage={staff.dailyWage || 0} />}
+        {view === "cash" && <ShopDays days={tillDays || []} sales={sales} onChange={setTillDays} />}
         {view === "checks" && <DailyChecks staff={staff.name} />}
         {view === "orders" && <YodeymaOrders orders={yodeymaOrders} setOrders={setYodeymaOrders} staff={staff.name} onPayment={recordYodeymaPayment} />}
         {view === "backfill" && (
@@ -1623,6 +1664,7 @@ export default function Home() {
 
         {view === "reports" && staff.admin && (
           <section className="reports-page">
+            <StaffByDay />
             <div className="metric-grid">
               <article>
                 <span>Today’s sales</span>

@@ -3408,3 +3408,40 @@ select:focus-visible {
 @media print {
   .sidebar, .notice { display: none !important; }
 }
+
+/* ---- Opening and closing the shop (ShopDay.tsx) ---- */
+.shop-day-modal { max-height: calc(100vh - 2rem); overflow-y: auto; }
+.shop-day-tick { display: flex; align-items: center; gap: 0.6rem; padding: 0.7rem 0.8rem; border: 1px solid var(--line); border-radius: 0.6rem; font-weight: 700; }
+.shop-day-tick input { width: 1.4rem; height: 1.4rem; }
+.close-shop-form, .close-shop-result { display: grid; gap: 0.7rem; }
+.close-shop-form h2, .close-shop-result h2 { margin: 0; font-size: 1.3rem; color: #173f36; }
+.close-shop-steps { margin: 0; padding-left: 1.2rem; display: grid; gap: 0.35rem; color: #3d4a44; line-height: 1.4; }
+.close-shop-count, .close-shop-note { display: grid; gap: 0.3rem; font-weight: 700; font-size: 0.85rem; }
+.close-shop-count .money-input input { font-size: 1.3rem; font-weight: 800; }
+.close-shop-check { margin: 0; font-weight: 800; color: #1d5a49; }
+.close-shop-check.out { color: #a3352a; }
+.close-shop-result { padding: 0.9rem; border-radius: 0.75rem; background: #e4efe8; }
+.close-shop-result.has-issue { background: #fbe3e0; }
+.close-shop-result.has-issue h2 { color: #7a1f17; }
+.close-shop-result p { margin: 0; color: #3d4a44; }
+.shop-days { display: grid; gap: 1rem; }
+.shop-today-rows p { margin: 0 0 0.4rem; }
+.shop-today .danger-button, .shop-today .primary-small { margin-top: 0.5rem; margin-right: 0.5rem; }
+.shop-history-row { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; padding: 0.55rem 0; border-bottom: 1px solid var(--line); font-size: 0.82rem; }
+.shop-history-row strong { min-width: 6.5rem; }
+.shop-history-row small { flex-basis: 100%; color: #7a1f17; }
+.shop-history-row.has-issue { color: #a3352a; }
+
+/* ---- Staff by day (StaffByDay.tsx) ---- */
+.staff-by-day { grid-column: 1 / -1; min-width: 0; max-width: 100%; overflow: hidden; }
+.sbd-day { padding: 0.75rem 0; border-top: 1px solid var(--line); }
+.sbd-day.has-issue { background: #fdf1ef; margin: 0 -0.75rem; padding: 0.75rem; border-radius: 0.6rem; }
+.sbd-head { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.35rem; }
+.sbd-flag { padding: 0.15rem 0.5rem; border-radius: 0.4rem; background: #a3352a; color: #fff; font-size: 0.72rem; font-weight: 800; }
+.sbd-shop { display: flex; flex-wrap: wrap; gap: 0.2rem 1rem; font-size: 0.8rem; color: #3d4a44; margin-bottom: 0.5rem; }
+.sbd-shop .out { color: #a3352a; font-weight: 700; }
+.sbd-shop small { flex-basis: 100%; color: #7a1f17; }
+.sbd-table { overflow-x: auto; max-width: 100%; }
+.sbd-row { display: grid; grid-template-columns: 7rem 4.5rem 5rem 3.5rem 5rem 5rem 6.5rem 6.5rem 9rem; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.8rem; min-width: 52rem; border-bottom: 1px solid rgba(0, 0, 0, 0.05); }
+.sbd-row-head b { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em; }
+.sbd-row .warn { color: #8a5a12; font-weight: 700; }

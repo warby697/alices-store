@@ -121,6 +121,20 @@ export async function refundSaleNow(saleId: string) {
   return body.data as { products: Record<string, unknown>[]; sales: Record<string, unknown>[] };
 }
 
+// Opening ("open": £50 float confirmed) or closing ("close": takings counted,
+// float left) today's shop. The server works out the day's cash sales itself
+// and returns the updated list of shop days.
+export async function tillDayNow(action: "open" | "close", details: { takingsCounted?: number; floatLeft?: boolean; note?: string } = {}) {
+  const response = await fetch("/api/state/till-day", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action, ...details }),
+  });
+  const body = await response.json().catch(() => ({})) as { data?: { day?: Record<string, unknown>; days?: Record<string, unknown>[] }; error?: string };
+  if (!response.ok || !body.data?.days) throw new Error(body.error || "Could not save - please try again");
+  return body.data as { day: Record<string, unknown>; days: Record<string, unknown>[] };
+}
+
 export async function saveLiveStateNow(data: Record<string, unknown>) {
   const response = await fetch("/api/state", {
     method: "PUT",
