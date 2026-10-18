@@ -69,11 +69,24 @@ function localSave(product: Product, stock: StockChange | undefined, staff: stri
   });
 }
 
-function localDelete(id: string) {
+// Deleting a product is recorded in the movement log (who, when, and the
+// count it had) - a deletion used to leave no trace at all, so a missing
+// till button could not be traced back to anyone.
+function deletionMovements(products: Product[], id: string, staff: string): Movement[] {
+  const gone = products.find((product) => product.id === id);
+  if (!gone) return [];
+  const count = Number(gone.stock) || 0;
+  return [movement(staff, "delete", gone, count, 0)];
+}
+
+function localDelete(id: string, staff: string) {
   return mutateLocalState((state) => {
     const products = Array.isArray(state.products) ? (state.products as Product[]) : [];
     const next = products.filter((product) => product.id !== id);
-    return { state: { ...state, products: next }, result: next };
+    return {
+      state: { ...state, products: next, stock_log: appendMovements(state.stock_log, deletionMovements(products, id, staff)) },
+      result: next,
+    };
   });
 }
 
@@ -131,18 +144,24 @@ export async function DELETE(request: Request) {
   try {
     const body = await request.json() as { id?: string };
     if (!body.id || typeof body.id !== "string") return Response.json({ error: "Invalid product" }, { status: 400 });
+    const staff = await staffFromSession(request);
     try {
       const { db, ready } = getStore();
       await ready;
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT value FROM store_state WHERE key = 'products' FOR UPDATE");
-        const current = Array.isArray(locked.rows[0]?.value) ? locked.rows[0].value as Product[] : [];
+        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('products', 'stock_log') FOR UPDATE");
+        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
+        const current = Array.isArray(state.products) ? state.products as Product[] : [];
         const next = current.filter((product) => product.id !== body.id);
         await client.query(
           "INSERT INTO store_state (key, value, updated_at) VALUES ('products', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
           [JSON.stringify(next)],
+        );
+        await client.query(
+          "INSERT INTO store_state (key, value, updated_at) VALUES ('stock_log', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+          [JSON.stringify(appendMovements(state.stock_log, deletionMovements(current, body.id, staff)))],
         );
         await client.query("COMMIT");
         return Response.json({ data: { products: next } });
@@ -154,7 +173,7 @@ export async function DELETE(request: Request) {
       }
     } catch (error) {
       if (process.env.NODE_ENV !== "development") throw error;
-      return Response.json({ data: { products: await localDelete(body.id) }, local: true });
+      return Response.json({ data: { products: await localDelete(body.id, staff) }, local: true });
     }
   } catch (error) {
     console.error("Product delete failed", error);

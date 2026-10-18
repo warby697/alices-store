@@ -22,7 +22,7 @@ type BasketLine = { id:string; qty:number };
 type Member = { id:string; name:string; pin:string; role:"Admin"|"Staff"; accessible:boolean; active:boolean; dailyWage?:number };
 type Movement = { id:string; at:string; staff:string; productId:string; product:string; from:number; to:number; reason:string };
 // Plain-English labels for the movement log's reasons.
-const MOVE_LABELS:Record<string,string>={sale:"Sold at the till",waste:"Written off (gone off)",perk:"Owner's perk",refund:"Refund - put back",restock:"Restock on the Stock page",trip:"Shopping trip trolley",count:"Count confirmed",check:"Scanned on the Stock page (checked)",edit:"Edited in product details",new:"New product added",adjust:"Adjusted"};
+const MOVE_LABELS:Record<string,string>={sale:"Sold at the till",waste:"Written off (gone off)",perk:"Owner's perk",refund:"Refund - put back",restock:"Restock on the Stock page",trip:"Shopping trip trolley",count:"Count confirmed",delete:"Product deleted",merge:"Merged duplicate",check:"Scanned on the Stock page (checked)",edit:"Edited in product details",new:"New product added",adjust:"Adjusted"};
 type Supplier = { id:string; name:string; contact:string; notes:string; spend:number; preferred?:boolean };
 type Audit = { id:string; at:string; action:string; detail:string; staff:string };
 const money=(n:number)=>new Intl.NumberFormat("en-GB",{style:"currency",currency:"GBP"}).format(n);
