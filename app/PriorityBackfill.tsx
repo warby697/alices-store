@@ -39,6 +39,9 @@ export function PriorityBackfill({
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  // Delete needs a second tap in the page itself: the browser's own pop-up can
+  // be switched off on a device, and then it silently answers no.
+  const [armedDelete, setArmedDelete] = useState<string | null>(null);
   const [pending, setPending] = useState<Record<string, Partial<Product>>>({});
   const [showDupes, setShowDupes] = useState(true);
   const [addingSupplier, setAddingSupplier] = useState<string | null>(null);
@@ -202,7 +205,12 @@ export function PriorityBackfill({
   };
 
   const remove = async (p: Product, reason: string) => {
-    if (!window.confirm(`Delete "${p.name || "Unnamed"}"? ${reason}\n\nThis cannot be undone.`)) return;
+    if (armedDelete !== p.id) {
+      setArmedDelete(p.id);
+      setNotice(`Tap Delete again to delete "${p.name || "Unnamed"}". ${reason} This cannot be undone.`);
+      return;
+    }
+    setArmedDelete(null);
     setBusy(p.id);
     try {
       const saved = await deleteProductNow(p.id) as unknown as Product[];
@@ -345,7 +353,7 @@ export function PriorityBackfill({
                         </span>
                         <span className="pb-dupe-actions">
                           <button className="pb-keep" disabled={busy === p.id} onClick={() => mergeGroup(g.items, p.id)} title="Keep this one, delete the others and add their stock in">Keep</button>
-                          <button className="pb-del" disabled={busy === p.id} onClick={() => remove(p, "Removing a duplicate barcode entry.")}>Delete</button>
+                          <button className="pb-del" disabled={busy === p.id} onClick={() => remove(p, "Removing a duplicate barcode entry.")}>{armedDelete === p.id ? "Tap again" : "Delete"}</button>
                         </span>
                       </div>
                     ))}
@@ -437,7 +445,7 @@ export function PriorityBackfill({
                     title={p.discontinued ? "Start stocking this again" : "No longer stocked - keeps the record but drops it off the shopping list"}
                     onClick={() => void saveField(p, { discontinued: !p.discontinued })}
                   >{p.discontinued ? "Restock" : "Drop"}</button>
-                  <button className="pb-del" disabled={busy === p.id} onClick={() => remove(p, "Use for duplicates or expired/discontinued products.")}>Delete</button>
+                  <button className="pb-del" disabled={busy === p.id} onClick={() => remove(p, "Use for duplicates or expired/discontinued products.")}>{armedDelete === p.id ? "Tap again" : "Delete"}</button>
                 </span>
               </div>
             );

@@ -156,6 +156,12 @@ export default function Home() {
   const cashReceivedRef = useRef<HTMLInputElement>(null);
   const productSearchRef = useRef<HTMLInputElement>(null);
   const [editing, setEditing] = useState<Product | null>(null);
+  // Deleting asks for a second tap inside the till itself. The browser's own
+  // "are you sure?" pop-up can be switched off on a device ("prevent this page
+  // from creating dialogs"), and then it silently answers no - which made
+  // Delete look broken in the shop.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  useEffect(() => { setConfirmDeleteId(null); }, [editing?.id]);
   const [hydrated, setHydrated] = useState(false);
   const scanRef = useRef<HTMLInputElement>(null);
   const scannerBuffer = useRef("");
@@ -467,14 +473,6 @@ export default function Home() {
     productSearchRef.current?.focus();
   };
 
-  const addCashDigit = (digit: string) => {
-    setCashReceived((current) => {
-      if (digit === ".") return current.includes(".") ? current : `${current || "0"}.`;
-      const decimals = current.split(".")[1];
-      if (decimals?.length >= 2) return current;
-      return current === "0" ? digit : `${current}${digit}`;
-    });
-  };
 
   const addProduct = (product: Product) => {
     if (document.activeElement instanceof HTMLInputElement)
@@ -804,8 +802,6 @@ export default function Home() {
   const completeSale = async (method: PaymentMethod) => {
     if (!staff || !cart.length) return;
     const enteredCash = Math.round(Number(splitCash) * 100) / 100;
-    const cashTendered = Math.round(Number(cashReceived) * 100) / 100;
-    if (method === "Cash" && cashTendered < total) return;
     if (
       method === "Split" &&
       (!enteredCash || enteredCash <= 0 || enteredCash >= total)
@@ -1001,7 +997,11 @@ export default function Home() {
 
   const deleteProduct = async () => {
     if (!editing || !products.some((product) => product.id === editing.id)) return;
-    if (!window.confirm(`Delete ${editing.name} from the product catalogue?\n\nPrevious sales will stay in the sales history.`)) return;
+    if (confirmDeleteId !== editing.id) {
+      setConfirmDeleteId(editing.id);
+      return;
+    }
+    setConfirmDeleteId(null);
     setNotice("Deleting product...");
     try {
       const savedList = await deleteProductNow(editing.id);
@@ -1406,13 +1406,15 @@ export default function Home() {
                 >
                   Take payment <span>→</span>
                 </button>
-                <button
-                  className="cash-shortcut"
-                  disabled={!cart.length}
-                  onClick={() => setPayment("Owner's Perk")}
-                >
-                  Owner&apos;s Perk — remove from stock
-                </button>
+                {staff.admin && (
+                  <button
+                    className="cash-shortcut"
+                    disabled={!cart.length}
+                    onClick={() => setPayment("Owner's Perk")}
+                  >
+                    Owner&apos;s Perk — remove from stock
+                  </button>
+                )}
                 <button
                   className="cash-shortcut waste-shortcut"
                   disabled={!cart.length}
@@ -1819,22 +1821,7 @@ export default function Home() {
               </>
             ) : (
               <>
-                {payment === "Cash" ? (
-                  <div className="split-payment cash-change">
-                    <label>
-                      Cash received
-                      <span className="money-input">£<input ref={cashReceivedRef} autoFocus inputMode="decimal" type="number" min={total} step="0.01" value={cashReceived} onChange={(event) => setCashReceived(event.target.value)} /></span>
-                    </label>
-                    <div className="cash-keypad" aria-label="Cash amount keypad">
-                      {["1","2","3","4","5","6","7","8","9",".","0"].map((digit) => (
-                        <button type="button" key={digit} onClick={() => addCashDigit(digit)}>{digit}</button>
-                      ))}
-                      <button type="button" aria-label="Delete last cash digit" onClick={() => setCashReceived((current) => current.slice(0,-1))}>⌫</button>
-                      <button type="button" className="cash-keypad-exact" onClick={() => setCashReceived(total.toFixed(2))}>Exact amount</button>
-                    </div>
-                    <div><span>Change to give</span><strong>{money(Math.max(0, (Number(cashReceived) || 0) - total))}</strong></div>
-                  </div>
-                ) : payment === "Split" ? (
+                {payment === "Split" ? (
                   <div className="split-payment">
                     <label>
                       Cash received
@@ -1873,7 +1860,6 @@ export default function Home() {
                 <button
                   className="pay-button"
                   disabled={
-                    (payment === "Cash" && Number(cashReceived) < total) ||
                     (payment === "Split" &&
                     (!Number(splitCash) ||
                       Number(splitCash) <= 0 ||
@@ -2077,7 +2063,14 @@ export default function Home() {
               )}
             </div>
             <div className="product-edit-actions">
-              {products.some((product) => product.id === editing.id) && <button type="button" className="danger-button" onClick={deleteProduct}>Delete product</button>}
+              {products.some((product) => product.id === editing.id) && (confirmDeleteId === editing.id ? (
+                <>
+                  <button type="button" className="danger-button delete-confirm" onClick={deleteProduct}>Tap again to delete {editing.name}</button>
+                  <button type="button" className="cash-shortcut" onClick={() => setConfirmDeleteId(null)}>Keep it</button>
+                </>
+              ) : (
+                <button type="button" className="danger-button" onClick={deleteProduct}>Delete product</button>
+              ))}
               <button className="pay-button">Save product</button>
             </div>
           </form>
