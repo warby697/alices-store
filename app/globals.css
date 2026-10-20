@@ -3445,3 +3445,13 @@ select:focus-visible {
 .sbd-row { display: grid; grid-template-columns: 7rem 4.5rem 5rem 3.5rem 5rem 5rem 6.5rem 6.5rem 9rem; gap: 0.4rem; padding: 0.3rem 0; font-size: 0.8rem; min-width: 52rem; border-bottom: 1px solid rgba(0, 0, 0, 0.05); }
 .sbd-row-head b { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.02em; }
 .sbd-row .warn { color: #8a5a12; font-weight: 700; }
+
+/* Reduce a price on a basket line: a clear tappable chip under the item name. */
+.line-price { display: inline-flex; align-items: center; flex-wrap: wrap; gap: .3rem; border: none; background: none; font: inherit; font-size: .78rem; color: #4d5a53; text-align: left; padding: .15rem .3rem; margin: .15rem 0 0 -.3rem; border-radius: .35rem; cursor: pointer; }
+.line-price:hover { background: #eef2ea; color: #24302b; }
+.line-price.reduced { color: #a3352a; font-weight: 700; }
+.basket-line .line-price em { font-style: normal; font-weight: 400; color: #97a09a; text-decoration: line-through; font-size: .74rem; }
+.line-price .price-tag { font-style: normal; font-size: .7rem; font-weight: 700; color: #14463a; background: #e3efe8; border: 1px solid #b9d3c4; border-radius: 999px; padding: .1rem .5rem; }
+.line-price.reduced .price-tag { color: #a3352a; background: #fbe9e6; border-color: #eab8b0; }
+.price-edit { display: inline-flex !important; align-items: center; gap: .15rem; margin-top: .15rem; font-size: .9rem; font-weight: 700; color: #24302b !important; }
+.price-edit input { width: 76px; font: inherit; font-size: .95rem; border: 1px solid #14463a; border-radius: .4rem; padding: .25rem .4rem; background: #fff; }
