@@ -53,7 +53,8 @@ function apply(days: TillDay[], sales: Sale[], body: Body, staff: string): { day
     const counted = Number(body.takingsCounted);
     if (!Number.isFinite(counted) || counted < 0) throw new Error("Enter the cash taken out");
     if (body.floatLeft !== true) throw new Error("Confirm the £50 float is left in the drawer");
-    if (existing?.closedAt) throw new Error(`Already closed by ${existing.closedBy} at ${new Date(existing.closedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit" })}`);
+    // Someone else already closed today: nothing to change, hand it back.
+    if (existing?.closedAt) return { days, day: existing };
     const cashSales = cashSalesFor(sales, date);
     const note = typeof body.note === "string" ? body.note.trim().slice(0, 500) : "";
     const day: TillDay = {

@@ -85,7 +85,8 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<{ day: TillDay; days: TillDay[] } | null>(null);
+  const [result, setResult] = useState<{ day: TillDay; days: TillDay[]; already?: boolean } | null>(null);
+  const [startedAt] = useState(() => new Date().toISOString());
   const countedValue = counted === "" ? NaN : Number(counted);
   const mismatch = Number.isFinite(countedValue) && Math.abs(countedValue - cashSales) >= 0.005;
   const canSave = Number.isFinite(countedValue) && countedValue >= 0 && floatLeft && (!mismatch || note.trim().length > 0) && !busy;
@@ -101,7 +102,8 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
     setError("");
     try {
       const r = await tillDayNow("close", { takingsCounted: countedValue, floatLeft: true, note: note.trim() || undefined });
-      setResult({ day: r.day as unknown as TillDay, days: r.days as unknown as TillDay[] });
+      const day = r.day as unknown as TillDay;
+      setResult({ day, days: r.days as unknown as TillDay[], already: Boolean(day.closedAt && day.closedAt < startedAt) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not save - please try again");
     } finally {
@@ -109,6 +111,15 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
     }
   };
 
+  if (result?.already) {
+    return (
+      <div className="close-shop-result">
+        <h2>✓ Already closed for today</h2>
+        <p>{result.day.closedBy} closed the shop at {time(result.day.closedAt)}{typeof result.day.takingsCounted === "number" ? ` and counted ${money(result.day.takingsCounted)} (${balanceText(result.day)})` : ""}. Nothing more to do.</p>
+        <button type="button" className="pay-button" onClick={() => onClosed(result.days)}>{finishLabel}</button>
+      </div>
+    );
+  }
   if (result) {
     const balanced = typeof result.day.difference === "number" && Math.abs(result.day.difference) < 0.005;
     return (

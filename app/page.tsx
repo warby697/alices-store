@@ -322,8 +322,17 @@ export default function Home() {
   };
   // Signing out while the shop is open for the day asks whether this is the
   // closing sign-out; if it is, the cash is counted and balanced first.
-  const requestSignOut = () => {
-    const openToday = !todayTill?.closedAt && (Boolean(todayTill?.openedAt) || sales.some((x) => x.at && dayKeyOf(new Date(x.at)) === checkToday));
+  const requestSignOut = async () => {
+    // Another till may have closed up since this screen last refreshed.
+    let latest = todayTill;
+    try {
+      const live = await loadLiveState();
+      if (Array.isArray(live.till_days)) {
+        setTillDays(live.till_days as TillDay[]);
+        latest = (live.till_days as TillDay[]).find((d) => d.date === checkToday);
+      }
+    } catch { /* offline: go on what this screen knows */ }
+    const openToday = !latest?.closedAt && (Boolean(latest?.openedAt) || sales.some((x) => x.at && dayKeyOf(new Date(x.at)) === checkToday));
     if (openToday && !isSunday) setSignOutStep("ask");
     else signOutNow();
   };
