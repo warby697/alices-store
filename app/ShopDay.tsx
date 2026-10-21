@@ -89,6 +89,11 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
   const countedValue = counted === "" ? NaN : Number(counted);
   const mismatch = Number.isFinite(countedValue) && Math.abs(countedValue - cashSales) >= 0.005;
   const canSave = Number.isFinite(countedValue) && countedValue >= 0 && floatLeft && (!mismatch || note.trim().length > 0) && !busy;
+  // Say exactly what is still needed, so a greyed-out button is never a mystery.
+  const missing = !Number.isFinite(countedValue) || countedValue < 0 ? "Enter the takings counted above"
+    : !floatLeft ? "Tick the £50 float box"
+    : mismatch && !note.trim() ? "Say what happened (it doesn't balance)"
+    : "";
 
   const save = async () => {
     if (!canSave) return;
@@ -126,8 +131,9 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
       </ol>
       <label className="close-shop-count">
         Takings counted
-        <span className="money-input">£<input type="number" inputMode="decimal" min="0" step="0.01" value={counted} onChange={(e) => setCounted(e.target.value)} placeholder={cashSales.toFixed(2)} /></span>
+        <span className="money-input">£<input type="number" inputMode="decimal" min="0" step="0.01" value={counted} onChange={(e) => setCounted(e.target.value)} placeholder="Type the amount" /></span>
       </label>
+      <button type="button" className="close-shop-exact" onClick={() => setCounted(cashSales.toFixed(2))}>✓ I counted exactly {money(cashSales)}</button>
       {Number.isFinite(countedValue) && (
         <p className={`close-shop-check${mismatch ? " out" : ""}`}>
           {mismatch ? (countedValue < cashSales ? `${money(cashSales - countedValue)} short` : `${money(countedValue - cashSales)} over`) : "✓ Matches today's cash sales"}
@@ -144,7 +150,7 @@ export function CloseShopForm({ cashSales, onClosed, onCancel, finishLabel = "Do
         </label>
       )}
       {error && <p className="restock-error">{error}</p>}
-      <button type="button" className="pay-button" disabled={!canSave} onClick={() => void save()}>{busy ? "Saving..." : "Confirm and close the shop"}</button>
+      <button type="button" className="pay-button" disabled={!canSave} onClick={() => void save()}>{busy ? "Saving..." : missing || "Confirm and close the shop"}</button>
       <button type="button" className="cash-shortcut" onClick={onCancel}>Go back</button>
     </div>
   );

@@ -3455,3 +3455,5 @@ select:focus-visible {
 .line-price.reduced .price-tag { color: #a3352a; background: #fbe9e6; border-color: #eab8b0; }
 .price-edit { display: inline-flex !important; align-items: center; gap: .15rem; margin-top: .15rem; font-size: .9rem; font-weight: 700; color: #24302b !important; }
 .price-edit input { width: 76px; font: inherit; font-size: .95rem; border: 1px solid #14463a; border-radius: .4rem; padding: .25rem .4rem; background: #fff; }
+.close-shop-exact { justify-self: start; border: 1px solid #b9d3c4; background: #e3efe8; color: #14463a; font: inherit; font-weight: 700; font-size: .9rem; padding: .55rem .9rem; border-radius: .6rem; cursor: pointer; }
+.close-shop-exact:hover { background: #d3e7db; }
