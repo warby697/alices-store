@@ -3462,3 +3462,5 @@ select:focus-visible {
 .session-expired h2 { color: #173f36; }
 .session-expired .eyebrow { color: #14463a; }
 .session-expired .pin-dots { justify-content: center; }
+.unsent-banner { display: grid; gap: .2rem; margin: 0 0 .8rem; padding: .75rem 1rem; border-radius: .7rem; background: #fff4d6; border: 1px solid #e7c76a; color: #5c4510; }
+.unsent-banner span { font-size: .85rem; }

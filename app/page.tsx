@@ -9,7 +9,7 @@ import { DailyChecks } from "./DailyChecks";
 import { PriorityBackfill } from "./PriorityBackfill";
 import { StockStepper } from "./StockStepper";
 import { YodeymaOrders, type YodeymaOrder } from "./YodeymaOrders";
-import { SESSION_EXPIRED_EVENT, SESSION_RESTORED_EVENT, adjustStockNow, completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
+import { SESSION_EXPIRED_EVENT, SESSION_RESTORED_EVENT, UNSENT_SALES_EVENT, adjustStockNow, completeLiveSale, flushUnsentSales, readUnsentSales, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
 import { isLowStock } from "./stock-levels";
 
 type Product = {
@@ -145,6 +145,14 @@ export default function Home() {
   const [checkPromptOpen, setCheckPromptOpen] = useState(false);
   // The sign-in ran out while the till was open: ask for a PIN on top.
   const [sessionExpired, setSessionExpired] = useState(false);
+  // Sales kept on this tablet that the server hasn't confirmed yet.
+  const [unsentSales, setUnsentSales] = useState(0);
+  useEffect(() => {
+    const count = () => setUnsentSales(readUnsentSales().length);
+    count();
+    window.addEventListener(UNSENT_SALES_EVENT, count);
+    return () => window.removeEventListener(UNSENT_SALES_EVENT, count);
+  }, []);
   // Set while signing back in, so the opening prompts don't pop up again.
   const resumingSession = useRef(false);
   useEffect(() => {
@@ -268,6 +276,31 @@ export default function Home() {
     return () => window.removeEventListener("beforeunload", warn);
   }, []);
 
+  // Server's sales plus any still waiting on this tablet, so the screen (and
+  // the closing cash count) never drops a sale that hasn't been sent yet.
+  const withUnsent = (serverSales: Sale[]) => {
+    const waiting = readUnsentSales().map((m) => m.sale as unknown as Sale).filter((x) => !serverSales.some((y) => y.id === x.id));
+    return waiting.length ? [...waiting, ...serverSales] : serverSales;
+  };
+  // Keep sending waiting sales: straight away, every 15 seconds while any are
+  // waiting, when the signal comes back, and the moment someone signs in.
+  useEffect(() => {
+    if (!staff) return;
+    let cancelled = false;
+    const flush = async () => {
+      if (!readUnsentSales().length) return;
+      const latest = await flushUnsentSales();
+      if (cancelled || !latest || pendingWrites.current > 0) return;
+      if (Array.isArray(latest.products)) setProducts(latest.products as Product[]);
+      if (Array.isArray(latest.sales)) setSales(withUnsent(latest.sales as Sale[]));
+    };
+    void flush();
+    const timer = window.setInterval(() => void flush(), 15000);
+    const onBack = () => void flush();
+    window.addEventListener("online", onBack);
+    window.addEventListener(SESSION_RESTORED_EVENT, onBack);
+    return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener("online", onBack); window.removeEventListener(SESSION_RESTORED_EVENT, onBack); };
+  }, [staff]);
   useEffect(() => {
     if (!staff) return;
     // Paint the last known catalogue first so the till is usable straight away,
@@ -279,7 +312,7 @@ export default function Home() {
     void (async () => {
       const live = await loadLiveState();
       setProducts(Array.isArray(live.products) ? live.products as Product[] : []);
-      setSales(Array.isArray(live.sales) ? live.sales as Sale[] : []);
+      setSales(withUnsent(Array.isArray(live.sales) ? live.sales as Sale[] : []));
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
       setCheckedDays(checkDaysFrom(live.daily_checks));
       setTillDays(Array.isArray(live.till_days) ? live.till_days as TillDay[] : []);
@@ -366,7 +399,7 @@ export default function Home() {
       const live = await loadLiveState();
       if (cancelled || pendingWrites.current > 0 || !Object.keys(live).length) return;
       if (Array.isArray(live.products)) setProducts(live.products as Product[]);
-      if (Array.isArray(live.sales)) setSales(live.sales as Sale[]);
+      if (Array.isArray(live.sales)) setSales(withUnsent(live.sales as Sale[]));
       setCheckedDays(checkDaysFrom(live.daily_checks));
       if (Array.isArray(live.till_days)) setTillDays(live.till_days as TillDay[]);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
@@ -1253,6 +1286,12 @@ export default function Home() {
             </div>
           )}
         </header>
+        {unsentSales > 0 && (
+          <div className="unsent-banner" role="status">
+            <strong>{unsentSales === 1 ? "1 sale is" : `${unsentSales} sales are`} saved on this tablet, waiting to send</strong>
+            <span>Nothing is lost - it sends by itself{sessionExpired ? " as soon as a PIN is entered" : " when the connection is back"}. Keep serving as normal.</span>
+          </div>
+        )}
         {checkDueToday && view !== "checks" && (
           <button type="button" className="check-due-banner" onClick={() => setView("checks")}>
             <strong>⚠ Today&apos;s fridge check hasn&apos;t been done</strong>
