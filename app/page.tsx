@@ -143,8 +143,6 @@ export default function Home() {
   // insist on today's check from the moment someone signs in.
   const [checkedDays, setCheckedDays] = useState<string[] | null>(null);
   const [checkPromptOpen, setCheckPromptOpen] = useState(false);
-  // The sign-in ran out while the till was open: ask for a PIN on top.
-  const [sessionExpired, setSessionExpired] = useState(false);
   // Sales kept on this tablet that the server hasn't confirmed yet.
   const [unsentSales, setUnsentSales] = useState(0);
   useEffect(() => {
@@ -153,10 +151,18 @@ export default function Home() {
     window.addEventListener(UNSENT_SALES_EVENT, count);
     return () => window.removeEventListener(UNSENT_SALES_EVENT, count);
   }, []);
-  // Set while signing back in, so the opening prompts don't pop up again.
-  const resumingSession = useRef(false);
+  // The sign-in ran out (12 hours) while the till was open: sign right out to
+  // the PIN screen, so whoever is there has to sign in as themselves. Sales
+  // still waiting on the tablet are kept and send after the next sign-in.
   useEffect(() => {
-    const onExpired = () => setSessionExpired(true);
+    const onExpired = () => {
+      void fetch("/api/session", { method: "DELETE" });
+      setSignOutStep(null);
+      setStaff(null);
+      setCart([]);
+      setPin("");
+      setLoginError("You were signed out automatically - enter your PIN to carry on");
+    };
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
   }, []);
@@ -316,11 +322,8 @@ export default function Home() {
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
       setCheckedDays(checkDaysFrom(live.daily_checks));
       setTillDays(Array.isArray(live.till_days) ? live.till_days as TillDay[] : []);
-      if (!resumingSession.current) {
-        setCheckPromptOpen(true);
-        setFloatPromptOpen(true);
-      }
-      resumingSession.current = false;
+      setCheckPromptOpen(true);
+      setFloatPromptOpen(true);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
       setHydrated(true);
@@ -1100,10 +1103,7 @@ export default function Home() {
       setPin("");
       return;
     }
-    if (sessionExpired) resumingSession.current = true;
     setStaff(result.staff);
-    if (sessionExpired) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
-    setSessionExpired(false);
     setPin("");
     setLoginError("");
   };
@@ -1289,7 +1289,7 @@ export default function Home() {
         {unsentSales > 0 && (
           <div className="unsent-banner" role="status">
             <strong>{unsentSales === 1 ? "1 sale is" : `${unsentSales} sales are`} saved on this tablet, waiting to send</strong>
-            <span>Nothing is lost - it sends by itself{sessionExpired ? " as soon as a PIN is entered" : " when the connection is back"}. Keep serving as normal.</span>
+            <span>Nothing is lost - it sends by itself as soon as it can. Keep serving as normal.</span>
           </div>
         )}
         {checkDueToday && view !== "checks" && (
@@ -1297,25 +1297,6 @@ export default function Home() {
             <strong>⚠ Today&apos;s fridge check hasn&apos;t been done</strong>
             <span>Tap here to do it now{missedEarlier ? ` - and ${missedEarlier === 1 ? "1 earlier day is" : `${missedEarlier} earlier days are`} missing` : ""}</span>
           </button>
-        )}
-        {sessionExpired && (
-          <div className="modal-backdrop check-due-backdrop session-expired-backdrop">
-            <div className="check-due-modal session-expired" role="alertdialog" aria-labelledby="expired-title">
-              <p className="eyebrow">Signed out</p>
-              <h2 id="expired-title">Enter your PIN to carry on</h2>
-              <p>Sign-ins last 12 hours. Nothing on screen is lost - after your PIN, press save again if you were saving.</p>
-              <div className="pin-dots" aria-label={`${pin.length} of 4 digits entered`}>
-                {[0, 1, 2, 3].map((i) => <span key={i} className={pin.length > i ? "filled" : ""} />)}
-              </div>
-              {loginError && <p className="error-note" role="alert">{loginError}</p>}
-              <div className="keypad">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => <button type="button" key={n} onClick={() => addPinDigit(String(n))}>{n}</button>)}
-                <button type="button" className="key-action" onClick={() => setPin("")}>Clear</button>
-                <button type="button" onClick={() => addPinDigit("0")}>0</button>
-                <button type="button" className="key-action" aria-label="Delete last digit" onClick={() => setPin((current) => current.slice(0, -1))}>Delete</button>
-              </div>
-            </div>
-          </div>
         )}
         {floatDue && floatPromptOpen && (
           <OpenShopPrompt
