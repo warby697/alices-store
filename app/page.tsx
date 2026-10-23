@@ -48,6 +48,30 @@ type Product = {
 type CartLine = { product: Product; quantity: number; price?: number };
 // What this line actually sells for: the override if one was typed in at the
 // till, otherwise the shelf price.
+// Pictures for the payment choice: a bank card, and a note with coins.
+const CardArt = () => (
+  <svg viewBox="0 0 120 80" aria-hidden="true">
+    <rect x="4" y="6" width="112" height="70" rx="9" fill="#1f4e9c" />
+    <rect x="4" y="20" width="112" height="13" fill="#0f2f63" />
+    <rect x="16" y="44" width="20" height="15" rx="3" fill="#f2c94c" />
+    <path d="M22 44v15M30 44v15M16 51.5h20" stroke="#c99a1c" strokeWidth="1.4" />
+    <rect x="46" y="47" width="54" height="5" rx="2.5" fill="#9fb8e4" />
+    <rect x="46" y="57" width="34" height="5" rx="2.5" fill="#9fb8e4" />
+    <path d="M96 64a7 7 0 0 0 0-10M101 67a12 12 0 0 0 0-16" stroke="#fff" strokeWidth="2.2" fill="none" strokeLinecap="round" />
+  </svg>
+);
+const CashArt = () => (
+  <svg viewBox="0 0 120 80" aria-hidden="true">
+    <rect x="6" y="10" width="92" height="50" rx="6" fill="#2f8a57" />
+    <rect x="12" y="16" width="80" height="38" rx="4" fill="none" stroke="#9fd4b4" strokeWidth="2" />
+    <circle cx="52" cy="35" r="12" fill="#9fd4b4" />
+    <text x="52" y="41" textAnchor="middle" fontSize="17" fontWeight="800" fill="#1d5c39" fontFamily="Arial, sans-serif">£</text>
+    <circle cx="94" cy="60" r="15" fill="#e0a92e" stroke="#b07f14" strokeWidth="2.5" />
+    <text x="94" y="66" textAnchor="middle" fontSize="15" fontWeight="800" fill="#7a560a" fontFamily="Arial, sans-serif">£1</text>
+    <circle cx="74" cy="68" r="10" fill="#c9ccd1" stroke="#8e939a" strokeWidth="2" />
+  </svg>
+);
+
 const linePrice = (line: CartLine) => (typeof line.price === "number" ? line.price : line.product.price);
 const dayKeyOf = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 const checkDaysFrom = (raw: unknown): string[] =>
@@ -1864,7 +1888,7 @@ export default function Home() {
       {payment && (
         <div className="modal-backdrop">
           <section
-            className={payment === "Cash" ? "payment-modal cash-payment-modal" : "payment-modal"}
+            className={payment === "Cash" ? "payment-modal cash-payment-modal" : payment === "Choose" ? "payment-modal choose-payment-modal" : "payment-modal"}
             role="dialog"
             aria-modal="true"
             aria-label="Complete payment"
@@ -1872,9 +1896,15 @@ export default function Home() {
             <button className="modal-close" onClick={() => setPayment(null)}>
               ×
             </button>
-            <div className="payment-icon">
-              {payment === "Card" ? "◇" : payment === "Split" ? "½" : payment === "Waste" ? "⊘" : "£"}
-            </div>
+            {payment === "Card" ? (
+              <div className="payment-art"><CardArt /></div>
+            ) : payment === "Cash" ? (
+              <div className="payment-art"><CashArt /></div>
+            ) : payment !== "Choose" && (
+              <div className="payment-icon">
+                {payment === "Split" ? "½" : payment === "Waste" ? "⊘" : "£"}
+              </div>
+            )}
             <p className="eyebrow">
               {payment === "Choose"
                 ? "Choose payment type"
@@ -1886,25 +1916,28 @@ export default function Home() {
             </p>
             <h2>{money(total)}</h2>
             {payment === "Choose" ? (
-              <div className="payment-choices">
-                <button onClick={() => setPayment("Card")}>
-                  <b>◇</b>
-                  <span>Record card</span>
-                </button>
-                <button onClick={chooseCashPayment}>
-                  <b>£</b>
-                  <span>Record cash</span>
-                </button>
+              <>
+                <div className="pay-tiles">
+                  <button type="button" className="pay-tile pay-tile-card" onClick={() => setPayment("Card")}>
+                    <CardArt />
+                    <span>Card</span>
+                  </button>
+                  <button type="button" className="pay-tile pay-tile-cash" onClick={chooseCashPayment}>
+                    <CashArt />
+                    <span>Cash</span>
+                  </button>
+                </div>
                 <button
+                  type="button"
+                  className="pay-split-link"
                   onClick={() => {
                     setSplitCash("");
                     setPayment("Split");
                   }}
                 >
-                  <b>½</b>
-                  <span>Split payment</span>
+                  Part cash, part card
                 </button>
-              </div>
+              </>
             ) : payment === "Owner's Perk" || payment === "Waste" ? (
               <>
                 <p>

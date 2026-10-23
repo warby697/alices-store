@@ -3459,3 +3459,23 @@ select:focus-visible {
 .close-shop-exact:hover { background: #d3e7db; }
 .unsent-banner { display: grid; gap: .2rem; margin: 0 0 .8rem; padding: .75rem 1rem; border-radius: .7rem; background: #fff4d6; border: 1px solid #e7c76a; color: #5c4510; }
 .unsent-banner span { font-size: .85rem; }
+
+/* Payment choice: two big picture tiles, card on the left, cash on the right. */
+.choose-payment-modal { width: min(40rem, 100%); }
+.pay-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1.4rem 0 1rem; }
+.pay-tile { display: grid; justify-items: center; gap: .8rem; padding: 1.4rem 1rem 1.2rem; border-radius: 1rem; border: 3px solid; background: #fff; cursor: pointer; font: inherit; transition: transform .08s ease, box-shadow .15s ease; }
+.pay-tile svg { width: 100%; max-width: 150px; height: auto; }
+.pay-tile span { font-size: 1.9rem; font-weight: 800; letter-spacing: .01em; }
+.pay-tile:active { transform: scale(.97); }
+.pay-tile-card { border-color: #1f4e9c; background: #eef3fc; color: #173c7a; }
+.pay-tile-card:hover { box-shadow: 0 6px 18px rgba(31, 78, 156, .25); }
+.pay-tile-cash { border-color: #2f8a57; background: #eef8f1; color: #1d5c39; }
+.pay-tile-cash:hover { box-shadow: 0 6px 18px rgba(47, 138, 87, .25); }
+.pay-split-link { border: none; background: none; color: var(--muted); font: inherit; font-size: .9rem; font-weight: 700; text-decoration: underline; cursor: pointer; padding: .4rem; }
+.payment-art { width: 7rem; margin: 0 auto .6rem; }
+.payment-art svg { width: 100%; height: auto; display: block; }
+@media (max-width: 480px) {
+  .pay-tiles { gap: .6rem; }
+  .pay-tile { padding: 1rem .5rem .9rem; }
+  .pay-tile span { font-size: 1.5rem; }
+}
