@@ -1,6 +1,19 @@
+// Sign-ins last 12 hours. A tablet left on longer still shows the till, but
+// the server refuses every save - so any refusal tells the screen to ask for
+// a PIN again (over the top of whatever is open, so nothing typed is lost),
+// and the message says what to do instead of "Unauthorised".
+export const SESSION_EXPIRED_EVENT = "alices-store:signed-out";
+export const SESSION_RESTORED_EVENT = "alices-store:signed-in";
+async function apiFetch(input: string, init?: RequestInit) {
+  const response = await fetch(input, init);
+  if (response.status !== 401) return response;
+  if (typeof window !== "undefined") window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+  return new Response(JSON.stringify({ error: "Your sign-in has run out - enter your PIN, then press save again" }), { status: 401, headers: { "content-type": "application/json" } });
+}
+
 export async function loadLiveState(): Promise<Record<string, unknown>> {
   try {
-    const response = await fetch("/api/state", { cache: "no-store" });
+    const response = await apiFetch("/api/state", { cache: "no-store" });
     if (!response.ok) return {};
     const body = await response.json() as { data?: Record<string, unknown> };
     return body.data || {};
@@ -13,7 +26,7 @@ export type SaleMutation = {
 };
 
 export async function completeLiveSale(mutation: SaleMutation) {
-  const response = await fetch("/api/state/sale", {
+  const response = await apiFetch("/api/state/sale", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(mutation),
@@ -42,7 +55,7 @@ export type StockChange = { delta?: number; set?: number };
 // `reason` names the stock change in the movement log ("edit", "count"...);
 // it only matters when a stock change is sent alongside the product.
 export async function saveProductNow(product: Record<string, unknown>, stock?: StockChange, reason?: string) {
-  const response = await fetch("/api/state/product", {
+  const response = await apiFetch("/api/state/product", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ product, stock, reason }),
@@ -58,7 +71,7 @@ export async function saveProductNow(product: Record<string, unknown>, stock?: S
 }
 
 export async function deleteProductNow(id: string) {
-  const response = await fetch("/api/state/product", {
+  const response = await apiFetch("/api/state/product", {
     method: "DELETE",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ id }),
@@ -84,7 +97,7 @@ export async function deleteProductNow(id: string) {
 // opts.reason names the change in the stock movement log ("restock", "trip",
 // "count"...); the server records who and when from the session itself.
 export async function adjustStockNow(changes: { id: string; delta?: number; set?: number }[], opts?: { keepRecount?: boolean; reason?: string }) {
-  const response = await fetch("/api/state/stock", {
+  const response = await apiFetch("/api/state/stock", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -106,7 +119,7 @@ export async function adjustStockNow(changes: { id: string; delta?: number; set?
 // and puts the items back into its own stock count, all in one locked
 // transaction. Returns the fresh product and sales lists.
 export async function refundSaleNow(saleId: string) {
-  const response = await fetch("/api/state/refund", {
+  const response = await apiFetch("/api/state/refund", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ saleId }),
@@ -125,7 +138,7 @@ export async function refundSaleNow(saleId: string) {
 // float left) today's shop. The server works out the day's cash sales itself
 // and returns the updated list of shop days.
 export async function tillDayNow(action: "open" | "close", details: { takingsCounted?: number; floatLeft?: boolean; note?: string } = {}) {
-  const response = await fetch("/api/state/till-day", {
+  const response = await apiFetch("/api/state/till-day", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ action, ...details }),
@@ -136,7 +149,7 @@ export async function tillDayNow(action: "open" | "close", details: { takingsCou
 }
 
 export async function saveLiveStateNow(data: Record<string, unknown>) {
-  const response = await fetch("/api/state", {
+  const response = await apiFetch("/api/state", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ data }),
@@ -155,7 +168,11 @@ export function saveLiveState(data: Record<string, unknown>) {
   clearTimeout(timer);
   timer = setTimeout(async () => {
     const payload = pending; pending = {};
-    try { await fetch("/api/state", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ data: payload }) }); } catch { pending = { ...payload, ...pending }; }
+    try {
+      const response = await apiFetch("/api/state", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ data: payload }) });
+      // Signed out: keep it, and it goes with the next save after the PIN.
+      if (response.status === 401) pending = { ...payload, ...pending };
+    } catch { pending = { ...payload, ...pending }; }
   }, 500);
 }
 

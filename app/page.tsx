@@ -9,7 +9,7 @@ import { DailyChecks } from "./DailyChecks";
 import { PriorityBackfill } from "./PriorityBackfill";
 import { StockStepper } from "./StockStepper";
 import { YodeymaOrders, type YodeymaOrder } from "./YodeymaOrders";
-import { adjustStockNow, completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
+import { SESSION_EXPIRED_EVENT, SESSION_RESTORED_EVENT, adjustStockNow, completeLiveSale, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
 import { isLowStock } from "./stock-levels";
 
 type Product = {
@@ -143,6 +143,15 @@ export default function Home() {
   // insist on today's check from the moment someone signs in.
   const [checkedDays, setCheckedDays] = useState<string[] | null>(null);
   const [checkPromptOpen, setCheckPromptOpen] = useState(false);
+  // The sign-in ran out while the till was open: ask for a PIN on top.
+  const [sessionExpired, setSessionExpired] = useState(false);
+  // Set while signing back in, so the opening prompts don't pop up again.
+  const resumingSession = useRef(false);
+  useEffect(() => {
+    const onExpired = () => setSessionExpired(true);
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+  }, []);
   // Opening (£50 float) and closing (takings counted) the shop each day.
   const [tillDays, setTillDays] = useState<TillDay[] | null>(null);
   const [floatPromptOpen, setFloatPromptOpen] = useState(false);
@@ -273,9 +282,12 @@ export default function Home() {
       setSales(Array.isArray(live.sales) ? live.sales as Sale[] : []);
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
       setCheckedDays(checkDaysFrom(live.daily_checks));
-      setCheckPromptOpen(true);
       setTillDays(Array.isArray(live.till_days) ? live.till_days as TillDay[] : []);
-      setFloatPromptOpen(true);
+      if (!resumingSession.current) {
+        setCheckPromptOpen(true);
+        setFloatPromptOpen(true);
+      }
+      resumingSession.current = false;
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
       setHydrated(true);
@@ -352,7 +364,7 @@ export default function Home() {
     const refresh = async () => {
       if (pendingWrites.current > 0 || editing) return;
       const live = await loadLiveState();
-      if (cancelled || pendingWrites.current > 0) return;
+      if (cancelled || pendingWrites.current > 0 || !Object.keys(live).length) return;
       if (Array.isArray(live.products)) setProducts(live.products as Product[]);
       if (Array.isArray(live.sales)) setSales(live.sales as Sale[]);
       setCheckedDays(checkDaysFrom(live.daily_checks));
@@ -1055,7 +1067,10 @@ export default function Home() {
       setPin("");
       return;
     }
+    if (sessionExpired) resumingSession.current = true;
     setStaff(result.staff);
+    if (sessionExpired) window.dispatchEvent(new Event(SESSION_RESTORED_EVENT));
+    setSessionExpired(false);
     setPin("");
     setLoginError("");
   };
@@ -1243,6 +1258,25 @@ export default function Home() {
             <strong>⚠ Today&apos;s fridge check hasn&apos;t been done</strong>
             <span>Tap here to do it now{missedEarlier ? ` - and ${missedEarlier === 1 ? "1 earlier day is" : `${missedEarlier} earlier days are`} missing` : ""}</span>
           </button>
+        )}
+        {sessionExpired && (
+          <div className="modal-backdrop check-due-backdrop session-expired-backdrop">
+            <div className="check-due-modal session-expired" role="alertdialog" aria-labelledby="expired-title">
+              <p className="eyebrow">Signed out</p>
+              <h2 id="expired-title">Enter your PIN to carry on</h2>
+              <p>Sign-ins last 12 hours. Nothing on screen is lost - after your PIN, press save again if you were saving.</p>
+              <div className="pin-dots" aria-label={`${pin.length} of 4 digits entered`}>
+                {[0, 1, 2, 3].map((i) => <span key={i} className={pin.length > i ? "filled" : ""} />)}
+              </div>
+              {loginError && <p className="error-note" role="alert">{loginError}</p>}
+              <div className="keypad">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => <button type="button" key={n} onClick={() => addPinDigit(String(n))}>{n}</button>)}
+                <button type="button" className="key-action" onClick={() => setPin("")}>Clear</button>
+                <button type="button" onClick={() => addPinDigit("0")}>0</button>
+                <button type="button" className="key-action" aria-label="Delete last digit" onClick={() => setPin((current) => current.slice(0, -1))}>Delete</button>
+              </div>
+            </div>
+          </div>
         )}
         {floatDue && floatPromptOpen && (
           <OpenShopPrompt

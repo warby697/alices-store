@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { loadLiveState, saveLiveStateNow } from "./live-store";
+import { SESSION_RESTORED_EVENT, loadLiveState, saveLiveStateNow } from "./live-store";
 
 // Daily food-safety checks, for every staff member. Built to satisfy an
 // Environmental Health inspection following FSA "Safer Food, Better Business"
@@ -69,11 +69,17 @@ export function DailyChecks({ staff }: { staff: string }) {
   const today = dayKey(new Date(loadedAt));
 
   useEffect(() => {
-    void (async () => {
+    const load = async () => {
       const live = await loadLiveState();
+      if (!Object.keys(live).length) return;
       setChecks(Array.isArray(live.daily_checks) ? (live.daily_checks as DailyCheck[]) : []);
       setReady(true);
-    })();
+    };
+    void load();
+    // Signed back in after the 12 hours ran out: fetch what was refused.
+    const reload = () => void load();
+    window.addEventListener(SESSION_RESTORED_EVENT, reload);
+    return () => window.removeEventListener(SESSION_RESTORED_EVENT, reload);
   }, []);
 
   // A freezer reading is typed WITHOUT the minus sign (the box shows a fixed
@@ -112,7 +118,13 @@ export function DailyChecks({ staff }: { staff: string }) {
   }
 
   const persist = async (record: DailyCheck) => {
-    const next = [record, ...checks]
+    // Build on the latest saved list, never on what this screen loaded - if
+    // that load was refused (signed out) or is hours old, writing it back
+    // would wipe other people's checks.
+    const live = await loadLiveState();
+    if (!Object.keys(live).length) throw new Error("Couldn't reach the shop records - enter your PIN if asked, then press save again");
+    const latest = Array.isArray(live.daily_checks) ? (live.daily_checks as DailyCheck[]) : [];
+    const next = [record, ...latest.filter((c) => c.id !== record.id)]
       .filter((check) => loadedAt - new Date(check.at).getTime() < KEEP_MS)
       .sort((a, b) => b.date.localeCompare(a.date) || b.at.localeCompare(a.at));
     await saveLiveStateNow({ daily_checks: next });
