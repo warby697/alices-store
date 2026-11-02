@@ -2,6 +2,7 @@ import { staffFromSession, verifyStaffSession } from "../../session/auth";
 import { getStore } from "../../store";
 import { mutateLocalState } from "../local-store";
 import { appendMovements, movement, type Movement } from "../movements";
+import { addMovements, bumpRev, lockProducts, lockSale, readProducts, readSales, writeProduct, writeSale } from "../../shop-db";
 
 export const dynamic = "force-dynamic";
 
@@ -66,19 +67,25 @@ export async function POST(request: Request) {
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('products', 'sales', 'stock_log') FOR UPDATE");
-        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
-        const updated = applyRefund(
-          Array.isArray(state.products) ? state.products as Product[] : [],
-          Array.isArray(state.sales) ? state.sales as Sale[] : [],
-          body.saleId,
-          staff,
-        );
-        await client.query("INSERT INTO store_state (key, value, updated_at) VALUES ('products', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", [JSON.stringify(updated.products)]);
-        await client.query("INSERT INTO store_state (key, value, updated_at) VALUES ('sales', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", [JSON.stringify(updated.sales)]);
-        await client.query("INSERT INTO store_state (key, value, updated_at) VALUES ('stock_log', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()", [JSON.stringify(appendMovements(state.stock_log, updated.movements))]);
+        // Lock just this sale, then just the products it contained. Two
+        // tills refunding the same sale queue on the sale row, and the
+        // second sees it already refunded and changes nothing.
+        const sale = await lockSale(client, body.saleId) as Sale | null;
+        if (!sale) throw new Error("That sale could not be found");
+        const locked = await lockProducts(client, (sale.items || []).map((item) => item.id).filter(Boolean)) as Product[];
+        const updated = applyRefund(locked, [sale], body.saleId, staff);
+        if (updated.sales[0] !== sale) {
+          for (let i = 0; i < locked.length; i += 1) {
+            if (updated.products[i] !== locked[i]) await writeProduct(client, updated.products[i]);
+          }
+          await writeSale(client, updated.sales[0]);
+          await addMovements(client, updated.movements);
+          await bumpRev(client);
+        }
+        const products = await readProducts(client);
+        const sales = await readSales(client);
         await client.query("COMMIT");
-        return Response.json({ data: { products: updated.products, sales: updated.sales } });
+        return Response.json({ data: { products, sales } });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;

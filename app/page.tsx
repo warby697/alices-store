@@ -9,7 +9,7 @@ import { DailyChecks } from "./DailyChecks";
 import { PriorityBackfill } from "./PriorityBackfill";
 import { StockStepper } from "./StockStepper";
 import { YodeymaOrders, type YodeymaOrder } from "./YodeymaOrders";
-import { SESSION_EXPIRED_EVENT, SESSION_RESTORED_EVENT, UNSENT_SALES_EVENT, adjustStockNow, completeLiveSale, flushUnsentSales, readUnsentSales, deleteProductNow, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
+import { SESSION_EXPIRED_EVENT, SESSION_RESTORED_EVENT, UNSENT_SALES_EVENT, adjustStockNow, completeLiveSale, flushUnsentSales, readUnsentSales, deleteProductNow, fetchRevision, loadLive, loadLiveState, readCachedCatalogue, refundSaleNow, saveLiveState, saveProductNow, writeCachedCatalogue } from "./live-store";
 import { isLowStock } from "./stock-levels";
 
 type Product = {
@@ -145,6 +145,8 @@ const greetingFor = (date: Date) => {
   if (hour < 17) return "Good afternoon";
   return "Good evening";
 };
+
+const IDLE_MS = 30 * 60 * 1000;
 
 export default function Home() {
   const [staff, setStaff] = useState<Staff | null>(null);
@@ -298,6 +300,9 @@ export default function Home() {
   // window where a closed tab would lose a transaction. Count what is in flight
   // and make the browser ask before it lets that happen.
   const pendingWrites = useRef(0);
+  // The shop change counter as of the last full read, and when this till was last touched.
+  const revRef = useRef<number | null>(null);
+  const lastActive = useRef(Date.now());
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
       if (pendingWrites.current > 0) event.preventDefault();
@@ -340,7 +345,8 @@ export default function Home() {
       setProducts(cached.products as Product[]);
     }
     void (async () => {
-      const live = await loadLiveState();
+      const { data: live, rev } = await loadLive();
+      revRef.current = rev;
       setProducts(Array.isArray(live.products) ? live.products as Product[] : []);
       setSales(withUnsent(Array.isArray(live.sales) ? live.sales as Sale[] : []));
       setYodeymaOrders(Array.isArray(live.yodeyma_orders) ? live.yodeyma_orders as YodeymaOrder[] : []);
@@ -360,7 +366,7 @@ export default function Home() {
     if (!staff || view === "checks") return;
     let cancelled = false;
     void (async () => {
-      const live = await loadLiveState();
+      const live = await loadLiveState(["daily_checks"]);
       if (!cancelled && live.daily_checks !== undefined) setCheckedDays(checkDaysFrom(live.daily_checks));
     })();
     return () => { cancelled = true; };
@@ -398,7 +404,7 @@ export default function Home() {
     // Another till may have closed up since this screen last refreshed.
     let latest = todayTill;
     try {
-      const live = await loadLiveState();
+      const live = await loadLiveState(["till_days"]);
       if (Array.isArray(live.till_days)) {
         setTillDays(live.till_days as TillDay[]);
         latest = (live.till_days as TillDay[]).find((d) => d.date === checkToday);
@@ -413,17 +419,25 @@ export default function Home() {
     if (hydrated) writeCachedCatalogue(products);
   }, [hydrated, products]);
   useEffect(() => { if (hydrated) saveLiveState({ yodeyma_orders: yodeymaOrders }); }, [yodeymaOrders, hydrated]);
-  // Keep every till showing the same numbers: quietly re-fetch the live state
-  // every minute and whenever the tab comes back into view, so a tablet that
-  // has been signed in since morning is never hours out of date. Skipped while
-  // a save is in flight or the product editor is open, so a refresh can never
-  // overwrite what someone is in the middle of doing.
+  // Keep every till showing the same numbers. Every minute (and whenever the
+  // tab comes back into view) the till asks the server for its tiny change
+  // counter and only downloads the shop when that has moved - so an unchanged
+  // minute costs a few bytes, not the whole shop. Nothing is checked while the
+  // tab is hidden, or once nobody has touched this till for half an hour; the
+  // first touch (or the screen coming back on) catches up straight away. Skipped
+  // while a save is in flight or the product editor is open, so a refresh can
+  // never overwrite what someone is in the middle of doing.
   useEffect(() => {
     if (!hydrated) return;
     let cancelled = false;
+    lastActive.current = Date.now();
     const refresh = async () => {
+      if (document.visibilityState === "hidden" || Date.now() - lastActive.current > IDLE_MS) return;
       if (pendingWrites.current > 0 || editing) return;
-      const live = await loadLiveState();
+      const check = await fetchRevision();
+      if (cancelled || !check.ok) return;
+      if (check.rev !== null && check.rev === revRef.current) return;
+      const { data: live, rev } = await loadLive();
       if (cancelled || pendingWrites.current > 0 || !Object.keys(live).length) return;
       if (Array.isArray(live.products)) setProducts(live.products as Product[]);
       if (Array.isArray(live.sales)) setSales(withUnsent(live.sales as Sale[]));
@@ -431,11 +445,25 @@ export default function Home() {
       if (Array.isArray(live.till_days)) setTillDays(live.till_days as TillDay[]);
       const savedMargin = (live.settings as { targetMargin?: number } | undefined)?.targetMargin;
       if (typeof savedMargin === "number" && savedMargin >= 0) setTargetMargin(savedMargin);
+      revRef.current = rev;
     };
     const timer = window.setInterval(() => void refresh(), 60000);
-    const onVisible = () => { if (document.visibilityState === "visible") void refresh(); };
+    const onVisible = () => { if (document.visibilityState === "visible") { lastActive.current = Date.now(); void refresh(); } };
+    const onTouch = () => {
+      const wasIdle = Date.now() - lastActive.current > IDLE_MS;
+      lastActive.current = Date.now();
+      if (wasIdle) void refresh();
+    };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { cancelled = true; window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); };
+    window.addEventListener("pointerdown", onTouch, { passive: true });
+    window.addEventListener("keydown", onTouch, { passive: true });
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("pointerdown", onTouch);
+      window.removeEventListener("keydown", onTouch);
+    };
   }, [hydrated, editing]);
   useEffect(() => {
     const desktopScanner = window.matchMedia(

@@ -70,7 +70,7 @@ export function DailyChecks({ staff }: { staff: string }) {
 
   useEffect(() => {
     const load = async () => {
-      const live = await loadLiveState();
+      const live = await loadLiveState(["daily_checks"]);
       if (!Object.keys(live).length) return;
       setChecks(Array.isArray(live.daily_checks) ? (live.daily_checks as DailyCheck[]) : []);
       setReady(true);
@@ -121,7 +121,7 @@ export function DailyChecks({ staff }: { staff: string }) {
     // Build on the latest saved list, never on what this screen loaded - if
     // that load was refused (signed out) or is hours old, writing it back
     // would wipe other people's checks.
-    const live = await loadLiveState();
+    const live = await loadLiveState(["daily_checks"]);
     if (!Object.keys(live).length) throw new Error("Couldn't reach the shop records - enter your PIN if asked, then press save again");
     const latest = Array.isArray(live.daily_checks) ? (live.daily_checks as DailyCheck[]) : [];
     const next = [record, ...latest.filter((c) => c.id !== record.id)]

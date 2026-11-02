@@ -11,13 +11,40 @@ async function apiFetch(input: string, init?: RequestInit) {
   return new Response(JSON.stringify({ error: "Your sign-in has run out - enter your PIN, then press save again" }), { status: 401, headers: { "content-type": "application/json" } });
 }
 
-export async function loadLiveState(): Promise<Record<string, unknown>> {
+// Reads the shop from the server. Ask for just the parts you need by name
+// (e.g. ["daily_checks"]); with no keys you get what the till screen uses
+// (products, the last 45 days of sales, and the small settings values).
+// {} means the server could not be reached; a reachable server with nothing
+// stored yet answers { _loaded: true } so the two can be told apart.
+// `rev` is the shop's change counter as it was just BEFORE this read.
+export async function loadLive(keys?: string[], opts?: { salesDays?: number | "all" }): Promise<{ data: Record<string, unknown>; rev: number | null }> {
   try {
-    const response = await apiFetch("/api/state", { cache: "no-store" });
-    if (!response.ok) return {};
-    const body = await response.json() as { data?: Record<string, unknown> };
-    return body.data || {};
-  } catch { return {}; }
+    const params = new URLSearchParams();
+    if (keys?.length) params.set("keys", keys.join(","));
+    if (opts?.salesDays !== undefined) params.set("salesDays", String(opts.salesDays));
+    const query = params.toString();
+    const response = await apiFetch(`/api/state${query ? `?${query}` : ""}`, { cache: "no-store" });
+    if (!response.ok) return { data: {}, rev: null };
+    const body = await response.json() as { data?: Record<string, unknown>; rev?: number | null };
+    const data = body.data || {};
+    return { data: Object.keys(data).length ? data : { _loaded: true }, rev: typeof body.rev === "number" ? body.rev : null };
+  } catch { return { data: {}, rev: null }; }
+}
+
+export async function loadLiveState(keys?: string[], opts?: { salesDays?: number | "all" }): Promise<Record<string, unknown>> {
+  return (await loadLive(keys, opts)).data;
+}
+
+// Has anything changed since the last read? A few bytes instead of the whole
+// shop. ok:false means unreachable; rev:null means the server keeps no counter
+// (development), so the caller should just read everything.
+export async function fetchRevision(): Promise<{ ok: boolean; rev: number | null }> {
+  try {
+    const response = await apiFetch("/api/state/revision", { cache: "no-store" });
+    if (!response.ok) return { ok: false, rev: null };
+    const body = await response.json() as { rev?: number | null };
+    return { ok: true, rev: typeof body.rev === "number" ? body.rev : null };
+  } catch { return { ok: false, rev: null }; }
 }
 
 export type SaleMutation = {

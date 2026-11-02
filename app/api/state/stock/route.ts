@@ -2,6 +2,7 @@ import { staffFromSession, verifyStaffSession } from "../../session/auth";
 import { getStore } from "../../store";
 import { mutateLocalState } from "../local-store";
 import { appendMovements, movement, type Movement } from "../movements";
+import { addMovements, bumpRev, lockProducts, readProducts, writeProduct } from "../../shop-db";
 
 export const dynamic = "force-dynamic";
 
@@ -101,20 +102,18 @@ export async function POST(request: Request) {
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('products', 'stock_log') FOR UPDATE");
-        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
-        const current = Array.isArray(state.products) ? state.products as Product[] : [];
+        // Lock only the products being changed, apply the instructions to
+        // the server's own current numbers, write back just those rows.
+        const current = await lockProducts(client, changes.map((change) => change.id)) as Product[];
         const updated = applyChanges(current, changes, staff, reason);
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('products', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(updated.products)],
-        );
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('stock_log', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(appendMovements(state.stock_log, updated.movements))],
-        );
+        for (let i = 0; i < current.length; i += 1) {
+          if (updated.products[i] !== current[i]) await writeProduct(client, updated.products[i]);
+        }
+        await addMovements(client, updated.movements);
+        await bumpRev(client);
+        const products = await readProducts(client);
         await client.query("COMMIT");
-        return Response.json({ data: { products: updated.products, missing: updated.missing } });
+        return Response.json({ data: { products, missing: updated.missing } });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;

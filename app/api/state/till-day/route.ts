@@ -1,6 +1,7 @@
 import { staffFromSession, verifyStaffSession } from "../../session/auth";
 import { getStore } from "../../store";
 import { mutateLocalState } from "../local-store";
+import { bumpRev, readSales } from "../../shop-db";
 
 export const dynamic = "force-dynamic";
 
@@ -86,13 +87,18 @@ export async function POST(request: Request) {
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('till_days', 'sales') FOR UPDATE");
-        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
-        const result = apply(Array.isArray(state.till_days) ? state.till_days as TillDay[] : [], Array.isArray(state.sales) ? state.sales as Sale[] : [], body, staff);
+        // One shop-day change at a time (the row may not exist yet, so lock
+        // by number), and only the last few days of sales are needed to
+        // work out today's cash.
+        await client.query("SELECT pg_advisory_xact_lock(7002)");
+        const locked = await client.query("SELECT value FROM store_state WHERE key = 'till_days' FOR UPDATE");
+        const recent = await readSales(client, 3) as Sale[];
+        const result = apply(Array.isArray(locked.rows[0]?.value) ? locked.rows[0].value as TillDay[] : [], recent, body, staff);
         await client.query(
           "INSERT INTO store_state (key, value, updated_at) VALUES ('till_days', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
           [JSON.stringify(trim(result.days))],
         );
+        await bumpRev(client);
         await client.query("COMMIT");
         return Response.json({ data: { day: result.day, days: trim(result.days) } });
       } catch (error) {

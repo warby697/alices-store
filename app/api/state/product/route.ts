@@ -2,6 +2,7 @@ import { staffFromSession, verifyStaffSession } from "../../session/auth";
 import { getStore } from "../../store";
 import { mutateLocalState } from "../local-store";
 import { appendMovements, movement, type Movement } from "../movements";
+import { addMovements, bumpRev, lockProducts, readProducts, removeProduct, writeProduct } from "../../shop-db";
 
 export const dynamic = "force-dynamic";
 
@@ -109,20 +110,16 @@ export async function POST(request: Request) {
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('products', 'stock_log') FOR UPDATE");
-        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
-        const current = Array.isArray(state.products) ? state.products as Product[] : [];
+        // Lock and rewrite only this one product's row.
+        const current = await lockProducts(client, [product.id]) as Product[];
         const next = mergeProduct(current, product, stock, staff, reason);
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('products', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(next.products)],
-        );
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('stock_log', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(appendMovements(state.stock_log, next.movements))],
-        );
+        const saved = next.products.find((candidate) => candidate.id === product.id);
+        if (saved) await writeProduct(client, saved);
+        await addMovements(client, next.movements);
+        await bumpRev(client);
+        const products = await readProducts(client);
         await client.query("COMMIT");
-        return Response.json({ data: { products: next.products } });
+        return Response.json({ data: { products } });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
@@ -151,20 +148,13 @@ export async function DELETE(request: Request) {
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        const locked = await client.query("SELECT key, value FROM store_state WHERE key IN ('products', 'stock_log') FOR UPDATE");
-        const state = Object.fromEntries(locked.rows.map((row: { key: unknown; value: unknown }) => [String(row.key), row.value]));
-        const current = Array.isArray(state.products) ? state.products as Product[] : [];
-        const next = current.filter((product) => product.id !== body.id);
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('products', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(next)],
-        );
-        await client.query(
-          "INSERT INTO store_state (key, value, updated_at) VALUES ('stock_log', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-          [JSON.stringify(appendMovements(state.stock_log, deletionMovements(current, body.id, staff)))],
-        );
+        const current = await lockProducts(client, [body.id]) as Product[];
+        await removeProduct(client, body.id);
+        await addMovements(client, deletionMovements(current, body.id, staff));
+        await bumpRev(client);
+        const products = await readProducts(client);
         await client.query("COMMIT");
-        return Response.json({ data: { products: next } });
+        return Response.json({ data: { products } });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;

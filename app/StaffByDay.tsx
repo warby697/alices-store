@@ -28,7 +28,7 @@ export function StaffByDay() {
   const [span, setSpan] = useState(14);
   useEffect(() => {
     void (async () => {
-      const live = await loadLiveState();
+      const live = await loadLiveState(["sales", "stock_log", "sign_ins", "till_days", "daily_checks"], { salesDays: 65 });
       setData({
         sales: Array.isArray(live.sales) ? live.sales as Sale[] : [],
         moves: Array.isArray(live.stock_log) ? live.stock_log as Move[] : [],
