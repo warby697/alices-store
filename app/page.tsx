@@ -175,6 +175,12 @@ export default function Home() {
   const cashReceivedRef = useRef<HTMLInputElement>(null);
   const productSearchRef = useRef<HTMLInputElement>(null);
   const [editing, setEditing] = useState<Product | null>(null);
+  // Merge products: tick several (e.g. every boxed cake) and fold them into one
+  // product that carries all their barcodes.
+  const [mergeMode, setMergeMode] = useState(false);
+  const [mergeIds, setMergeIds] = useState<string[]>([]);
+  const [merge, setMerge] = useState<{ name: string; price: number; category: string } | null>(null);
+  const [mergeBusy, setMergeBusy] = useState(false);
   // Deleting asks for a second tap inside the till itself. The browser's own
   // "are you sure?" pop-up can be switched off on a device ("prevent this page
   // from creating dialogs"), and then it silently answers no - which made
@@ -605,6 +611,11 @@ export default function Home() {
   const productScan = (code: string) => {
     const product = products.find((candidate) => ownsBarcode(candidate, code) || (candidate.caseBarcode && candidate.caseBarcode === code));
     setSearch("");
+    if (product && mergeMode) {
+      setMergeIds((current) => (current.includes(product.id) ? current.filter((id) => id !== product.id) : [...current, product.id]));
+      setNotice(`${product.name} ticked for merging`);
+      return;
+    }
     if (product) {
       setNotice(`✓ ${product.name} is already on - ${money(product.price)}`);
       speak(`${product.name}, already on`);
@@ -787,6 +798,60 @@ export default function Home() {
         pendingWrites.current -= 1;
       }
     })();
+  };
+
+  const mergeSelected = products.filter((p) => mergeIds.includes(p.id));
+  const leaveMergeMode = () => { setMergeMode(false); setMergeIds([]); setMerge(null); };
+  const openMerge = () => {
+    if (mergeSelected.length < 2) return;
+    setMerge({ name: mergeSelected[0].name, price: mergeSelected[0].price, category: mergeSelected[0].category });
+  };
+  // The first ticked product becomes the group and takes every barcode the
+  // others had (so scanning any of them rings up the group); the others are
+  // removed. Old sales keep the names they were sold under.
+  const doMerge = async () => {
+    if (!merge || mergeSelected.length < 2 || mergeBusy) return;
+    const name = merge.name.trim();
+    if (!name || !(merge.price > 0)) return;
+    setMergeBusy(true);
+    pendingWrites.current += 1;
+    const [target, ...others] = mergeSelected;
+    const codes = Array.from(new Set(mergeSelected
+      .flatMap((p) => [p.barcode, ...(p.altBarcodes || []), p.caseBarcode])
+      .map((code) => code?.trim())
+      .filter((code): code is string => Boolean(code))));
+    const mainCode = target.barcode?.trim() || codes[0];
+    const costs = mergeSelected.map((p) => p.cost).filter((cost) => cost > 0);
+    const merged: Product = {
+      ...target,
+      name,
+      price: Math.round(merge.price * 100) / 100,
+      category: merge.category,
+      cost: costs.length ? Math.round((costs.reduce((a, b) => a + b, 0) / costs.length) * 100) / 100 : 0,
+      barcode: mainCode,
+      altBarcodes: codes.filter((code) => code !== mainCode),
+      caseBarcode: undefined,
+      caseQuantity: undefined,
+      quick: mergeSelected.some((p) => p.quick),
+      discontinued: undefined,
+    };
+    try {
+      let list = await saveProductNow(merged as unknown as Record<string, unknown>);
+      for (const other of others) list = await deleteProductNow(other.id);
+      setProducts(list as unknown as Product[]);
+      setCart((current) => current.filter((line) => !others.some((other) => other.id === line.product.id)));
+      setNotice(`Merged ${mergeSelected.length} products into "${name}"`);
+      leaveMergeMode();
+    } catch (error) {
+      // Part-way through: show whatever the server actually has now.
+      const live = await loadLiveState(["products"]);
+      if (Array.isArray(live.products)) setProducts(live.products as Product[]);
+      setNotice(error instanceof Error ? `MERGE NOT FINISHED: ${error.message} - check the Products list` : "MERGE NOT FINISHED - check the Products list");
+      leaveMergeMode();
+    } finally {
+      pendingWrites.current -= 1;
+      setMergeBusy(false);
+    }
   };
 
   const saveProduct = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -1302,9 +1367,20 @@ export default function Home() {
                 {search && <button type="button" aria-label="Clear product search" onClick={() => setSearch("")}>×</button>}
               </div>
               <div className="management-buttons">
-                <button className="primary-small" onClick={() => { setEditing({id:crypto.randomUUID(),name:"",price:0,cost:0,stock:0,category:"Groceries",colour:"#c7d9c0"}); }}>+ Add product</button>
+                {mergeMode ? (
+                  <>
+                    <button className="primary-small" disabled={mergeIds.length < 2} onClick={openMerge}>Merge {mergeIds.length} selected</button>
+                    <button onClick={leaveMergeMode}>Cancel</button>
+                  </>
+                ) : (
+                  <>
+                    <button onClick={() => { setMergeMode(true); setMergeIds([]); }}>Merge products</button>
+                    <button className="primary-small" onClick={() => { setEditing({id:crypto.randomUUID(),name:"",price:0,cost:0,stock:0,category:"Groceries",colour:"#c7d9c0"}); }}>+ Add product</button>
+                  </>
+                )}
               </div>
             </div>
+            {mergeMode && <p className="cash-instruction">Tick the products to combine (search to find them, or scan them). Press Merge, choose the name and price, and they become one product that keeps all their barcodes.</p>}
             <div className="product-table">
               <div className="table-head">
                 <span>Product</span>
@@ -1333,7 +1409,13 @@ export default function Home() {
                         ? `${Math.round(((p.price - p.cost) / p.price) * 100)}%`
                         : "—"}
                     </span>
-                    <button onClick={() => setEditing(p)}>Edit</button>
+                    {mergeMode ? (
+                      <button className={mergeIds.includes(p.id) ? "primary-small" : ""} onClick={() => setMergeIds((current) => (current.includes(p.id) ? current.filter((id) => id !== p.id) : [...current, p.id]))}>
+                        {mergeIds.includes(p.id) ? "✓ Ticked" : "Tick"}
+                      </button>
+                    ) : (
+                      <button onClick={() => setEditing(p)}>Edit</button>
+                    )}
                   </div>
                 ))}
             </div>
@@ -1607,6 +1689,47 @@ export default function Home() {
         </div>
       )}
 
+      {merge && (
+        <div className="modal-backdrop">
+          <form
+            className="edit-modal"
+            onSubmit={(e) => { e.preventDefault(); void doMerge(); }}
+            onKeyDown={(e) => {
+              const target = e.target as HTMLElement;
+              if (e.key === "Enter" && target.tagName === "INPUT") e.preventDefault();
+            }}
+          >
+            <button type="button" className="modal-close" onClick={() => setMerge(null)}>×</button>
+            <p className="eyebrow">Merge products</p>
+            <h2>Combine {mergeSelected.length} products into one</h2>
+            <div className="form-grid">
+              <label className="wide">
+                New name
+                <input required autoFocus value={merge.name} onChange={(e) => setMerge({ ...merge, name: e.target.value })} placeholder="e.g. Boxed cakes" />
+              </label>
+              <label>
+                Sale price
+                <input required type="number" inputMode="decimal" min="0.01" step="0.01" value={merge.price || ""} onChange={(e) => setMerge({ ...merge, price: Number(e.target.value) })} placeholder="£" />
+              </label>
+              <label>
+                Category
+                <select value={merge.category} onChange={(e) => setMerge({ ...merge, category: e.target.value })}>
+                  {Array.from(new Set([merge.category, ...categories.filter((item) => item !== "Most popular" && item !== "All products")])).map((item) => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </label>
+              {new Set(mergeSelected.map((p) => p.price)).size > 1 && (
+                <p className="wide field-help">These have different prices ({Array.from(new Set(mergeSelected.map((p) => money(p.price)))).join(", ")}). Everything will ring up at the price above.</p>
+              )}
+              <p className="wide field-help">
+                These will be removed and their barcodes moved onto the new product: {mergeSelected.map((p) => p.name).join(", ")}. Past sales keep their old names.
+              </p>
+            </div>
+            <div className="product-edit-actions">
+              <button className="pay-button" disabled={mergeBusy}>{mergeBusy ? "Merging..." : "Merge into one"}</button>
+            </div>
+          </form>
+        </div>
+      )}
       {editing && (
         <div className="modal-backdrop">
           <form

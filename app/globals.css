@@ -1133,7 +1133,7 @@ select:focus-visible {
 .table-head,
 .table-row {
   display: grid;
-  grid-template-columns: minmax(15rem, 2fr) 1fr 0.65fr 0.65fr 0.65fr 0.5fr;
+  grid-template-columns: minmax(15rem, 2fr) 1fr 0.65fr 0.65fr 0.5fr;
   align-items: center;
   gap: 0.8rem;
   padding: 0.75rem 1rem;
@@ -2607,12 +2607,12 @@ select:focus-visible {
   }
   .table-head,
   .table-row {
-    grid-template-columns: minmax(13rem, 2fr) 0.7fr 0.7fr 0.5fr;
+    grid-template-columns: minmax(13rem, 2fr) 0.7fr 0.5fr;
   }
   .table-head span:nth-child(2),
-  .table-head span:nth-child(5),
+  .table-head span:nth-child(4),
   .table-row > span:nth-child(2),
-  .table-row > span:nth-child(5) {
+  .table-row > span:nth-child(4) {
     display: none;
   }
 }
