@@ -1,4 +1,5 @@
-import type { Movement } from "./state/movements";
+// One entry of the old stock movement log. Nothing writes these any more.
+type Movement = { id: string; at: string; staff: string; productId: string; product: string; from: number; to: number; reason: string };
 
 // Row-per-item storage for the three lists that grow: products, sales and the
 // stock movement log. They used to be three giant JSON values in store_state,
@@ -90,15 +91,6 @@ export async function readProducts(client: Q) {
   return result.rows.map((r) => r.data as Row);
 }
 
-// Locks just these products (in id order, so two sales can never deadlock)
-// and returns them in the order asked for.
-export async function lockProducts(client: Q, ids: string[]) {
-  const unique = [...new Set(ids)].sort();
-  if (!unique.length) return [] as Row[];
-  const result = await client.query("SELECT id, data FROM shop_products WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE", [unique]);
-  return result.rows.map((r) => r.data as Row);
-}
-
 export async function writeProduct(client: Q, product: Row) {
   await client.query("INSERT INTO shop_products (id, data) VALUES ($1, $2::jsonb) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data", [String(product.id), JSON.stringify(product)]);
 }
@@ -129,12 +121,6 @@ export async function lockSale(client: Q, id: string) {
 
 export async function writeSale(client: Q, sale: Row) {
   await client.query("UPDATE shop_sales SET data = $2::jsonb WHERE id = $1", [String(sale.id), JSON.stringify(sale)]);
-}
-
-export async function addMovements(client: Q, movements: Movement[]) {
-  if (!movements.length) return;
-  await insertChunks(client, "shop_stock_log", movements.map((m) => ({ id: m.id, at: validTime(m.at), data: m as unknown as Row })));
-  await client.query("DELETE FROM shop_stock_log WHERE at < NOW() - ($1::int * INTERVAL '1 day')", [KEEP_MOVEMENT_DAYS]);
 }
 
 export async function readMovements(client: Q) {
