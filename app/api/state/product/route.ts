@@ -1,49 +1,121 @@
-import { verifyStaffSession } from "../../session/auth";
+import { staffFromSession, verifyStaffSession } from "../../session/auth";
 import { getStore } from "../../store";
 import { mutateLocalState } from "../local-store";
-import { bumpRev, readProducts, removeProduct, writeProduct } from "../../shop-db";
+import { appendMovements, movement, type Movement } from "../movements";
+import { addMovements, bumpRev, lockProducts, readProducts, removeProduct, writeProduct } from "../../shop-db";
 
 export const dynamic = "force-dynamic";
 
-// Saves or deletes ONE product: its row is written on its own, so editing a
-// price on one tablet never touches any other product. Stock is no longer
-// counted (Nov 2026); a product is its name, price, barcode and details.
+type Product = { id: string; name?: string; stock?: number; [key: string]: unknown };
+type StockChange = { delta?: number; set?: number };
 
-type Product = { id: string; name?: string; [key: string]: unknown };
+// Merge a single product into the catalogue by id, leaving every other product
+// (and its live stock) untouched. This is what keeps concurrent backfilling on
+// several tablets safe: each save only ever changes the one product it owns.
+//
+// The stock NUMBER inside the sent product is ignored for an existing record:
+// the server's live count wins, because the sender's screen may be hours old.
+// A deliberate stock change arrives separately as { delta } or { set } and is
+// applied to the server's own current figure.
+function mergeProduct(products: Product[], product: Product, stock: StockChange | undefined, staff: string, reason: string) {
+  const existing = products.find((candidate) => candidate.id === product.id);
+  const applyStock = (current: number) => {
+    if (typeof stock?.set === "number") return Math.max(0, Math.floor(stock.set));
+    if (typeof stock?.delta === "number") {
+      // Same rule as the stock route: additions land on the real (possibly
+      // below-zero) figure; a manual decrease never goes below zero by itself.
+      const delta = Math.floor(stock.delta);
+      return delta >= 0 ? current + delta : Math.max(Math.min(current, 0), current + delta);
+    }
+    return current;
+  };
+  const movements: Movement[] = [];
+  if (!existing) {
+    const opening = product.noStockCount ? 0 : applyStock(Number(product.stock) || 0);
+    // A brand-new product's opening count is a stock movement like any other.
+    if (opening > 0) movements.push(movement(staff, "new", product, 0, opening));
+    return { products: [...products, { ...product, stock: opening }], movements };
+  }
+  const from = Number(existing.stock) || 0;
+  // "Don't count stock" (loose items): the count is parked at zero, with no
+  // recount flag and no full-shelf target, so nothing about this product can
+  // show as wrong or land on the shopping list.
+  if (product.noStockCount) {
+    const parked: Product = { ...product, stock: 0 };
+    delete parked.recount;
+    delete parked.full;
+    if (from !== 0) movements.push(movement(staff, "edit", existing, from, 0));
+    return { products: products.map((candidate) => (candidate.id === product.id ? parked : candidate)), movements };
+  }
+  const merged: Product = { ...product, stock: applyStock(from) };
+  // The recount flag lives on the SERVER copy (a sale at zero sets it); the
+  // sender's stale copy neither sets nor keeps it. A deliberate stock change
+  // in this save is the recount happening, so the flag comes off.
+  if (typeof stock?.set === "number" || typeof stock?.delta === "number") {
+    delete merged.recount;
+    movements.push(movement(staff, reason, existing, from, merged.stock as number));
+  } else if (existing.recount) merged.recount = existing.recount;
+  else delete merged.recount;
+  return { products: products.map((candidate) => (candidate.id === product.id ? merged : candidate)), movements };
+}
 
-function localSave(product: Product) {
+function localSave(product: Product, stock: StockChange | undefined, staff: string, reason: string) {
   return mutateLocalState((state) => {
     const products = Array.isArray(state.products) ? (state.products as Product[]) : [];
-    const next = products.some((candidate) => candidate.id === product.id)
-      ? products.map((candidate) => (candidate.id === product.id ? product : candidate))
-      : [...products, product];
-    return { state: { ...state, products: next }, result: next };
+    const next = mergeProduct(products, product, stock, staff, reason);
+    return {
+      state: { ...state, products: next.products, stock_log: appendMovements(state.stock_log, next.movements) },
+      result: next.products,
+    };
   });
 }
 
-function localDelete(id: string) {
+// Deleting a product is recorded in the movement log (who, when, and the
+// count it had) - a deletion used to leave no trace at all, so a missing
+// till button could not be traced back to anyone.
+function deletionMovements(products: Product[], id: string, staff: string): Movement[] {
+  const gone = products.find((product) => product.id === id);
+  if (!gone) return [];
+  const count = Number(gone.stock) || 0;
+  return [movement(staff, "delete", gone, count, 0)];
+}
+
+function localDelete(id: string, staff: string) {
   return mutateLocalState((state) => {
     const products = Array.isArray(state.products) ? (state.products as Product[]) : [];
     const next = products.filter((product) => product.id !== id);
-    return { state: { ...state, products: next }, result: next };
+    return {
+      state: { ...state, products: next, stock_log: appendMovements(state.stock_log, deletionMovements(products, id, staff)) },
+      result: next,
+    };
   });
 }
 
 export async function POST(request: Request) {
   if (!(await verifyStaffSession(request))) return Response.json({ error: "Unauthorised" }, { status: 401 });
   try {
-    const body = await request.json() as { product?: Product };
+    const body = await request.json() as { product?: Product; stock?: StockChange; reason?: unknown };
     const product = body.product;
     if (!product?.id || typeof product.id !== "string" || !product.name || typeof product.name !== "string") {
       return Response.json({ error: "Invalid product" }, { status: 400 });
     }
+    const stock = body.stock && (typeof body.stock.delta === "number" || typeof body.stock.set === "number")
+      ? body.stock
+      : undefined;
+    const reason = typeof body.reason === "string" && /^[a-z-]{1,20}$/.test(body.reason) ? body.reason : "edit";
+    const staff = await staffFromSession(request);
     try {
       const { db, ready } = getStore();
       await ready;
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
-        await writeProduct(client, product);
+        // Lock and rewrite only this one product's row.
+        const current = await lockProducts(client, [product.id]) as Product[];
+        const next = mergeProduct(current, product, stock, staff, reason);
+        const saved = next.products.find((candidate) => candidate.id === product.id);
+        if (saved) await writeProduct(client, saved);
+        await addMovements(client, next.movements);
         await bumpRev(client);
         const products = await readProducts(client);
         await client.query("COMMIT");
@@ -56,7 +128,7 @@ export async function POST(request: Request) {
       }
     } catch (error) {
       if (process.env.NODE_ENV !== "development") throw error;
-      return Response.json({ data: { products: await localSave(product) }, local: true });
+      return Response.json({ data: { products: await localSave(product, stock, staff, reason) }, local: true });
     }
   } catch (error) {
     console.error("Product save failed", error);
@@ -69,13 +141,16 @@ export async function DELETE(request: Request) {
   try {
     const body = await request.json() as { id?: string };
     if (!body.id || typeof body.id !== "string") return Response.json({ error: "Invalid product" }, { status: 400 });
+    const staff = await staffFromSession(request);
     try {
       const { db, ready } = getStore();
       await ready;
       const client = await db.pool.connect();
       try {
         await client.query("BEGIN");
+        const current = await lockProducts(client, [body.id]) as Product[];
         await removeProduct(client, body.id);
+        await addMovements(client, deletionMovements(current, body.id, staff));
         await bumpRev(client);
         const products = await readProducts(client);
         await client.query("COMMIT");
@@ -88,7 +163,7 @@ export async function DELETE(request: Request) {
       }
     } catch (error) {
       if (process.env.NODE_ENV !== "development") throw error;
-      return Response.json({ data: { products: await localDelete(body.id) }, local: true });
+      return Response.json({ data: { products: await localDelete(body.id, staff) }, local: true });
     }
   } catch (error) {
     console.error("Product delete failed", error);

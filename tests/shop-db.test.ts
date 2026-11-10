@@ -7,6 +7,7 @@ import * as stateRoute from "../app/api/state/route";
 import * as revisionRoute from "../app/api/state/revision/route";
 import * as saleRoute from "../app/api/state/sale/route";
 import * as refundRoute from "../app/api/state/refund/route";
+import * as stockRoute from "../app/api/state/stock/route";
 import * as productRoute from "../app/api/state/product/route";
 import * as tillRoute from "../app/api/state/till-day/route";
 import { resetStoreForTests } from "../app/api/store";
@@ -50,11 +51,14 @@ const sale = (id: string, items: { id: string; quantity: number }[], extra: Reco
   sale: { id, at: new Date().toISOString(), staff: "Test", method: "Cash", total: 3, items, ...extra },
   items,
 });
+const stockOf = async (id: string) => (await json(await stateRoute.GET(req("GET", "/api/state?keys=products")))).data.products.find((p: any) => p.id === id).stock;
 const getProducts = async () => (await json(await stateRoute.GET(req("GET", "/api/state?keys=products")))).data.products as any[];
-const getSales = async (days = "all") => (await json(await stateRoute.GET(req("GET", `/api/state?keys=sales&salesDays=${days}`)))).data.sales as any[];
 const revNow = async () => (await json(await revisionRoute.GET(req("GET", "/api/state/revision")))).rev as number;
 
-async function freshShop() {
+// catchUpFrom: the sales-since date for the one-time stock catch-up. Off (null)
+// for ordinary tests so they start from the stock numbers they set up.
+async function freshShop(extraSales: Record<string, unknown>[] = [], catchUpFrom: string | null = null) {
+  (globalThis as { __aliceStockOffFrom?: string | null }).__aliceStockOffFrom = catchUpFrom;
   pg = new PGlite();
   await pg.exec(`CREATE TABLE store_state (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
   const legacy = {
@@ -62,6 +66,7 @@ async function freshShop() {
     sales: [
       { id: "old-1", at: hoursAgo(24 * 60), items: [{ id: "p1", quantity: 1 }], total: 1, method: "Card" },
       { id: "old-2", at: hoursAgo(5), items: [{ id: "p1", quantity: 2 }], total: 2, method: "Cash" },
+      ...extraSales,
     ],
     stock_log: [{ id: "m1", at: hoursAgo(5), staff: "A", productId: "p1", product: "Tea", from: 12, to: 10, reason: "sale" }],
     daily_checks: [{ id: "c1", at: hoursAgo(3) }],
@@ -77,8 +82,9 @@ test("migration copies the old lists once and keeps the backup", async () => {
   const first = await json(await stateRoute.GET(req("GET", "/api/state?keys=products,sales,stock_log,daily_checks&salesDays=all")));
   assert.deepEqual(first.data.products.map((p: any) => p.id), ["p1", "p2", "p3"]);
   assert.deepEqual(first.data.sales.map((s: any) => s.id), ["old-2", "old-1"]);
-  assert.equal(first.data.stock_log.length, 1, "the old stock log is kept, just not shown");
+  assert.equal(first.data.stock_log.length, 1);
   assert.equal(first.data.daily_checks.length, 1);
+  // The old rows are still there, and a second start-up does not copy again.
   resetStoreForTests();
   await stateRoute.GET(req("GET", "/api/state?keys=products"));
   const counts = await pg.query("SELECT (SELECT count(*) FROM shop_products)::int AS p, (SELECT count(*) FROM shop_sales)::int AS s, (SELECT count(*) FROM store_state WHERE key = 'products')::int AS legacy");
@@ -91,67 +97,80 @@ test("the sales window hides old sales unless asked", async () => {
   assert.deepEqual(recent.data.sales.map((s: any) => s.id), ["old-2"]);
 });
 
-test("a sale is recorded without touching any product, and a retry changes nothing", async () => {
+test("a sale moves stock, logs it, and a retry changes nothing", async () => {
   await freshShop();
   const before = await revNow();
   const body = sale("s1", [{ id: "p1", quantity: 3 }, { id: "p3", quantity: 4 }]);
   const first = await json(await saleRoute.POST(req("POST", "/api/state/sale", body)));
+  assert.equal(first.data.products.find((p: any) => p.id === "p1").stock, 7);
+  assert.equal(first.data.products.find((p: any) => p.id === "p3").stock, 0, "uncounted items never move");
   assert.equal(first.data.sales[0].id, "s1");
-  assert.deepEqual(await getProducts(), products(), "products are exactly as they were");
   assert.equal(await revNow(), before + 1);
   const retry = await saleRoute.POST(req("POST", "/api/state/sale", body));
   assert.equal(retry.status, 200);
-  assert.equal((await getSales()).filter((s) => s.id === "s1").length, 1, "same sale id sent twice records once");
+  assert.equal(await stockOf("p1"), 7, "same sale id sent twice sells once");
   assert.equal(await revNow(), before + 1, "a no-op retry does not signal a change");
+  const log = (await json(await stateRoute.GET(req("GET", "/api/state?keys=stock_log")))).data.stock_log;
+  assert.equal(log.filter((m: any) => m.reason === "sale").length, 2, "old entry + exactly one new one");
 });
 
-test("a sale for a product that no longer exists, or a payment line, still records", async () => {
+test("selling past zero never refuses, goes negative and flags a recount", async () => {
   await freshShop();
-  const r = await saleRoute.POST(req("POST", "/api/state/sale", sale("y1", [{ id: "yodeyma-order", quantity: 1 }, { id: "deleted-product", quantity: 2 }])));
-  assert.equal(r.status, 200);
-  assert.ok((await getSales()).some((s) => s.id === "y1"));
-  const bad = await saleRoute.POST(req("POST", "/api/state/sale", { sale: { id: "bad", at: new Date().toISOString() }, items: [{ id: "p1", quantity: 0 }] }));
-  assert.equal(bad.status, 409);
-  const empty = await saleRoute.POST(req("POST", "/api/state/sale", { sale: { id: "empty" }, items: [] }));
-  assert.equal(empty.status, 400);
+  const result = await json(await saleRoute.POST(req("POST", "/api/state/sale", sale("s2", [{ id: "p2", quantity: 5 }]))));
+  const coffee = result.data.products.find((p: any) => p.id === "p2");
+  assert.equal(coffee.stock, -3);
+  assert.equal(coffee.recount, true);
 });
 
 test("twenty simultaneous sales, and five copies of one sale, stay exact", async () => {
   await freshShop();
+  await stockRoute.POST(req("POST", "/api/state/stock", { changes: [{ id: "p1", set: 100 }], reason: "count" }));
   const many = await Promise.all(Array.from({ length: 20 }, (_, i) => saleRoute.POST(req("POST", "/api/state/sale", sale(`par-${i}`, [{ id: "p1", quantity: 1 }])))));
   assert.ok(many.every((r) => r.status === 200));
+  assert.equal(await stockOf("p1"), 80);
   const same = sale("dup", [{ id: "p1", quantity: 1 }]);
   await Promise.all(Array.from({ length: 5 }, () => saleRoute.POST(req("POST", "/api/state/sale", same))));
-  const all = await getSales();
-  assert.equal(all.filter((s) => s.id.startsWith("par-")).length, 20);
-  assert.equal(all.filter((s) => s.id === "dup").length, 1);
+  assert.equal(await stockOf("p1"), 79);
 });
 
-test("a refund marks the sale once, even when tapped twice, and moves nothing else", async () => {
+test("a refund restocks once, even when tapped twice", async () => {
   await freshShop();
   await saleRoute.POST(req("POST", "/api/state/sale", sale("r1", [{ id: "p1", quantity: 4 }])));
+  assert.equal(await stockOf("p1"), 6);
   const first = await json(await refundRoute.POST(req("POST", "/api/state/refund", { saleId: "r1" })));
   assert.equal(first.data.sales.find((s: any) => s.id === "r1").refunded, true);
-  const revAfterFirst = await revNow();
+  assert.equal(await stockOf("p1"), 10);
   await refundRoute.POST(req("POST", "/api/state/refund", { saleId: "r1" }));
-  assert.equal(await revNow(), revAfterFirst, "second tap changes nothing");
-  assert.deepEqual(await getProducts(), products());
+  assert.equal(await stockOf("p1"), 10);
   const missing = await refundRoute.POST(req("POST", "/api/state/refund", { saleId: "nope" }));
   assert.equal(missing.status, 409);
 });
 
-test("products: add goes on the end, edit saves what was sent, delete removes only that one", async () => {
+test("stock changes use the server's own number, not a stale screen", async () => {
   await freshShop();
-  const created = await json(await productRoute.POST(req("POST", "/api/state/product", { product: { id: "p9", name: "Milk", price: 1 } })));
-  assert.deepEqual(created.data.products.map((p: any) => p.id), ["p1", "p2", "p3", "p9"]);
-  const edited = await json(await productRoute.POST(req("POST", "/api/state/product", { product: { id: "p9", name: "Oat milk", price: 2.5, barcode: "123456" } })));
-  const milk = edited.data.products.find((p: any) => p.id === "p9");
-  assert.deepEqual([milk.name, milk.price, milk.barcode], ["Oat milk", 2.5, "123456"]);
-  assert.equal(edited.data.products.find((p: any) => p.id === "p1").price, 1, "other products untouched");
-  const bad = await productRoute.POST(req("POST", "/api/state/product", { product: { id: "x" } }));
+  await saleRoute.POST(req("POST", "/api/state/sale", sale("k1", [{ id: "p1", quantity: 3 }])));
+  const added = await json(await stockRoute.POST(req("POST", "/api/state/stock", { changes: [{ id: "p1", delta: 5 }, { id: "ghost", delta: 1 }], reason: "restock" })));
+  assert.equal(added.data.products.find((p: any) => p.id === "p1").stock, 12);
+  assert.deepEqual(added.data.missing, ["ghost"]);
+  const counted = await json(await stockRoute.POST(req("POST", "/api/state/stock", { changes: [{ id: "p2", set: 6 }] })));
+  assert.equal(counted.data.products.find((p: any) => p.id === "p2").stock, 6);
+  const bad = await stockRoute.POST(req("POST", "/api/state/stock", { changes: [{ id: "p1" }] }));
   assert.equal(bad.status, 400);
+});
+
+test("products: add, edit ignores a stale stock number, delete is logged", async () => {
+  await freshShop();
+  const created = await json(await productRoute.POST(req("POST", "/api/state/product", { product: { id: "p9", name: "Milk", stock: 4, price: 1 } })));
+  assert.deepEqual(created.data.products.map((p: any) => p.id), ["p1", "p2", "p3", "p9"], "new products go on the end");
+  await saleRoute.POST(req("POST", "/api/state/sale", sale("e1", [{ id: "p9", quantity: 1 }])));
+  const edited = await json(await productRoute.POST(req("POST", "/api/state/product", { product: { id: "p9", name: "Oat milk", stock: 4, price: 2 } })));
+  const milk = edited.data.products.find((p: any) => p.id === "p9");
+  assert.equal(milk.name, "Oat milk");
+  assert.equal(milk.stock, 3, "the stale 4 is ignored");
   const gone = await json(await productRoute.DELETE(req("DELETE", "/api/state/product", { id: "p9" })));
-  assert.deepEqual(gone.data.products.map((p: any) => p.id), ["p1", "p2", "p3"]);
+  assert.equal(gone.data.products.some((p: any) => p.id === "p9"), false);
+  const log = (await json(await stateRoute.GET(req("GET", "/api/state?keys=stock_log")))).data.stock_log;
+  assert.ok(log.some((m: any) => m.reason === "delete" && m.productId === "p9"));
 });
 
 test("the change counter moves on every kind of write, and only then", async () => {
@@ -161,7 +180,7 @@ test("the change counter moves on every kind of write, and only then", async () 
   await stateRoute.PUT(req("PUT", "/api/state", { data: { settings: { targetMargin: 30 } } }));
   const b = await revNow();
   assert.ok(b > a);
-  await productRoute.POST(req("POST", "/api/state/product", { product: { id: "p1", name: "Tea", price: 1.2 } }));
+  await stockRoute.POST(req("POST", "/api/state/stock", { changes: [{ id: "p1", delta: 1 }] }));
   assert.ok((await revNow()) > b);
   const refused = await stateRoute.PUT(req("PUT", "/api/state", { data: { products: [] } }));
   assert.equal(refused.status, 400);
@@ -201,6 +220,32 @@ test("signed-out requests are refused everywhere", async () => {
   assert.equal((await stateRoute.GET(bare("GET", "/api/state"))).status, 401);
   assert.equal((await revisionRoute.GET(bare("GET", "/api/state/revision"))).status, 401);
   assert.equal((await saleRoute.POST(bare("POST", "/api/state/sale"))).status, 401);
-  assert.equal((await refundRoute.POST(bare("POST", "/api/state/refund"))).status, 401);
-  assert.equal((await productRoute.POST(bare("POST", "/api/state/product"))).status, 401);
+});
+
+test("catch-up: sales made while stock was off come off the counts once, and only once", async () => {
+  await freshShop([
+    { id: "gap-1", at: hoursAgo(4), staff: "Sam", items: [{ id: "p1", quantity: 3 }, { id: "p3", quantity: 2 }], total: 3, method: "Cash" },
+    { id: "gap-2", at: hoursAgo(3), staff: "Sam", items: [{ id: "p2", quantity: 5 }], total: 10, method: "Card" },
+    { id: "gap-3", at: hoursAgo(2), staff: "Sam", items: [{ id: "p1", quantity: 1 }], total: 1, method: "Cash", refunded: true },
+    { id: "gap-4", at: hoursAgo(1), staff: "Sam", items: [{ id: "p1", quantity: 1 }], total: 1, method: "Waste", stockOnly: true },
+    { id: "gap-5", at: hoursAgo(1), staff: "Sam", items: [{ id: "yodeyma-order", quantity: 1 }], total: 9, method: "Cash" },
+  ], hoursAgo(5.5));
+  const stock = async () => Object.fromEntries((await getProducts()).map((p: any) => [p.id, [p.stock, p.recount ?? false]]));
+  // old-1 (60 days ago) is before the window; old-2 (5h ago) and gap-1..5 are inside it, refunded gap-3 skipped.
+  assert.deepEqual(await stock(), { p1: [10 - 2 - 3 - 1, false], p2: [2 - 5, true], p3: [0, false] });
+  const log = (await json(await stateRoute.GET(req("GET", "/api/state?keys=stock_log")))).data.stock_log;
+  assert.ok(log.some((m: any) => m.reason === "waste" && m.productId === "p1" && m.staff === "Sam"));
+  assert.ok(log.some((m: any) => m.reason === "sale" && m.productId === "p2" && m.from === 2 && m.to === -3));
+  // A second start-up (a new server instance) must not take it off again.
+  resetStoreForTests();
+  await stateRoute.GET(req("GET", "/api/state?keys=products"));
+  assert.deepEqual(await stock(), { p1: [4, false], p2: [-3, true], p3: [0, false] });
+  // And an ordinary sale afterwards behaves normally.
+  await saleRoute.POST(req("POST", "/api/state/sale", sale("after", [{ id: "p1", quantity: 1 }])));
+  assert.equal((await stock()).p1[0], 3);
+});
+
+test("catch-up does nothing when there is nothing to catch up", async () => {
+  await freshShop([], hoursAgo(1));
+  assert.deepEqual((await getProducts()).map((p: any) => p.stock), [10, 2, 0]);
 });

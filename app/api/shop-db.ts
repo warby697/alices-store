@@ -1,5 +1,4 @@
-// One entry of the old stock movement log. Nothing writes these any more.
-type Movement = { id: string; at: string; staff: string; productId: string; product: string; from: number; to: number; reason: string };
+import { movement, type Movement } from "./state/movements";
 
 // Row-per-item storage for the three lists that grow: products, sales and the
 // stock movement log. They used to be three giant JSON values in store_state,
@@ -71,11 +70,66 @@ export async function ensureShopSchema(client: Q) {
       await insertChunks(client, "shop_stock_log", log.map((m, n) => ({ id: String(m.id ?? `legacy-move-${n}`), at: validTime(m.at), data: m })));
       await client.query("INSERT INTO store_state (key, value) VALUES ($1, $2::jsonb)", [MIGRATED, JSON.stringify({ at: new Date().toISOString(), products: products.length, sales: sales.length, stock_log: log.length })]);
     }
+    await catchUpStock(client);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
   }
+}
+
+// Stock counting was switched off by mistake from 9 Nov 2026 (11:51 UK) until
+// it was put back. Every sale rung up in between never took anything off the
+// shelf count. The first time the restored code starts, this applies those
+// sales to the counts once (a marker row stops it ever running twice), logged
+// in the stock movement log like any other sale. Refunded sales are skipped:
+// sold then refunded nets to nothing.
+const STOCK_OFF_FROM = "2026-11-09T11:51:00Z";
+const CATCHUP = "sys_stock_catchup_v1";
+type Sale = Row & { items?: { id?: string; quantity?: number }[]; method?: string; staff?: string; refunded?: boolean };
+
+async function catchUpStock(client: Q) {
+  const done = await client.query("SELECT 1 FROM store_state WHERE key = $1", [CATCHUP]);
+  if (done.rows.length) return;
+  const override = (globalThis as { __aliceStockOffFrom?: string | null }).__aliceStockOffFrom;
+  const from = override === undefined ? STOCK_OFF_FROM : override;
+  let salesApplied = 0;
+  if (from) {
+    const found = await client.query("SELECT data FROM shop_sales WHERE at >= $1::timestamptz ORDER BY at, id", [from]);
+    const sales = found.rows.map((r) => r.data as Sale).filter((sale) => !sale.refunded);
+    const ids = [...new Set(sales.flatMap((sale) => (sale.items || []).map((item) => String(item.id ?? ""))))].filter(Boolean).sort();
+    if (ids.length) {
+      const locked = await client.query("SELECT id, data FROM shop_products WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE", [ids]);
+      const products = new Map(locked.rows.map((r) => [String(r.id), r.data as Row & { stock?: number; noStockCount?: boolean; name?: string; recount?: boolean }]));
+      const changed = new Set<string>();
+      const moves: Movement[] = [];
+      for (const sale of sales) {
+        const staff = typeof sale.staff === "string" ? sale.staff : "";
+        const reason = sale.method === "Waste" ? "waste" : sale.method === "Owner's Perk" ? "perk" : "sale";
+        const wanted = new Map<string, number>();
+        for (const item of sale.items || []) {
+          const quantity = Number(item.quantity);
+          if (!item.id || !Number.isFinite(quantity) || quantity <= 0) continue;
+          wanted.set(item.id, (wanted.get(item.id) || 0) + quantity);
+        }
+        for (const [id, quantity] of wanted) {
+          const product = products.get(id);
+          if (!product || product.noStockCount) continue;
+          const from = Number(product.stock) || 0;
+          const next = { ...product, stock: from - quantity } as typeof product;
+          if (from < quantity) next.recount = true;
+          moves.push({ ...movement(staff, reason, { id, name: product.name }, from, from - quantity), at: validTime(sale.at) });
+          products.set(id, next);
+          changed.add(id);
+        }
+        salesApplied += 1;
+      }
+      for (const id of changed) await writeProduct(client, products.get(id) as Row);
+      await addMovements(client, moves);
+      if (changed.size) await bumpRev(client);
+    }
+  }
+  await client.query("INSERT INTO store_state (key, value) VALUES ($1, $2::jsonb)", [CATCHUP, JSON.stringify({ at: new Date().toISOString(), from, sales: salesApplied })]);
 }
 
 // Every write bumps this one tiny counter. A till asks "has it changed?" by
@@ -88,6 +142,15 @@ export async function readRev(client: Q) {
 
 export async function readProducts(client: Q) {
   const result = await client.query("SELECT data FROM shop_products ORDER BY seq");
+  return result.rows.map((r) => r.data as Row);
+}
+
+// Locks just these products (in id order, so two sales can never deadlock)
+// and returns them in the order asked for.
+export async function lockProducts(client: Q, ids: string[]) {
+  const unique = [...new Set(ids)].sort();
+  if (!unique.length) return [] as Row[];
+  const result = await client.query("SELECT id, data FROM shop_products WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE", [unique]);
   return result.rows.map((r) => r.data as Row);
 }
 
@@ -121,6 +184,12 @@ export async function lockSale(client: Q, id: string) {
 
 export async function writeSale(client: Q, sale: Row) {
   await client.query("UPDATE shop_sales SET data = $2::jsonb WHERE id = $1", [String(sale.id), JSON.stringify(sale)]);
+}
+
+export async function addMovements(client: Q, movements: Movement[]) {
+  if (!movements.length) return;
+  await insertChunks(client, "shop_stock_log", movements.map((m) => ({ id: m.id, at: validTime(m.at), data: m as unknown as Row })));
+  await client.query("DELETE FROM shop_stock_log WHERE at < NOW() - ($1::int * INTERVAL '1 day')", [KEEP_MOVEMENT_DAYS]);
 }
 
 export async function readMovements(client: Q) {

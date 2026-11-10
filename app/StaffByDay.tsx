@@ -10,6 +10,7 @@ import { balanceText, dayKey, type TillDay } from "./ShopDay";
 // a second look is red.
 
 type Sale = { at: string; staff: string; method: string; total: number; cashAmount?: number; cardAmount?: number; refunded?: boolean; stockOnly?: boolean };
+type Move = { at: string; staff: string; reason: string };
 type SignIn = { at: string; staff: string };
 type Check = { date: string; at: string; staff: string; closed?: boolean };
 
@@ -19,17 +20,18 @@ const dayLabel = (date: string) => new Date(`${date}T12:00:00`).toLocaleDateStri
 
 type Person = {
   name: string; firstSignIn?: string; first?: string; last?: string;
-  sales: number; cash: number; card: number; perks: number; perkValue: number; waste: number; wasteValue: number;
+  sales: number; cash: number; card: number; perks: number; perkValue: number; waste: number; wasteValue: number; stockChanges: number; scans: number;
 };
 
 export function StaffByDay() {
-  const [data, setData] = useState<{ sales: Sale[]; signIns: SignIn[]; days: TillDay[]; checks: Check[] } | null>(null);
+  const [data, setData] = useState<{ sales: Sale[]; moves: Move[]; signIns: SignIn[]; days: TillDay[]; checks: Check[] } | null>(null);
   const [span, setSpan] = useState(14);
   useEffect(() => {
     void (async () => {
-      const live = await loadLiveState(["sales", "sign_ins", "till_days", "daily_checks"], { salesDays: 65 });
+      const live = await loadLiveState(["sales", "stock_log", "sign_ins", "till_days", "daily_checks"], { salesDays: 65 });
       setData({
         sales: Array.isArray(live.sales) ? live.sales as Sale[] : [],
+        moves: Array.isArray(live.stock_log) ? live.stock_log as Move[] : [],
         signIns: Array.isArray(live.sign_ins) ? live.sign_ins as SignIn[] : [],
         days: Array.isArray(live.till_days) ? live.till_days as TillDay[] : [],
         checks: Array.isArray(live.daily_checks) ? live.daily_checks as Check[] : [],
@@ -47,7 +49,7 @@ export function StaffByDay() {
     const sunday = d.getDay() === 0;
     const people = new Map<string, Person>();
     const person = (name: string) => {
-      if (!people.has(name)) people.set(name, { name, sales: 0, cash: 0, card: 0, perks: 0, perkValue: 0, waste: 0, wasteValue: 0 });
+      if (!people.has(name)) people.set(name, { name, sales: 0, cash: 0, card: 0, perks: 0, perkValue: 0, waste: 0, wasteValue: 0, stockChanges: 0, scans: 0 });
       return people.get(name) as Person;
     };
     const touch = (p: Person, at: string) => { if (!p.first || at < p.first) p.first = at; if (!p.last || at > p.last) p.last = at; };
@@ -65,6 +67,11 @@ export function StaffByDay() {
       const cash = typeof s.cashAmount === "number" ? s.cashAmount : s.method === "Cash" ? s.total : 0;
       p.cash += cash;
       p.card += typeof s.cardAmount === "number" ? s.cardAmount : s.method === "Card" ? s.total : Math.max(0, s.total - cash);
+    }
+    for (const m of data.moves) {
+      if (dayKey(new Date(m.at)) !== k || ["sale", "waste", "perk"].includes(m.reason)) continue;
+      const p = person(m.staff); touch(p, m.at);
+      if (m.reason === "check") p.scans += 1; else p.stockChanges += 1;
     }
     const fridge = data.checks.filter((c) => c.date === k && !c.closed).sort((a, b) => a.at.localeCompare(b.at))[0];
     if (fridge && dayKey(new Date(fridge.at)) === k) touch(person(fridge.staff), fridge.at);
@@ -104,7 +111,7 @@ export function StaffByDay() {
             </div>
             {r.people.length > 0 && (
               <div className="sbd-table">
-                <div className="sbd-row sbd-row-head"><b>Staff</b><b>Signed in</b><b>Last active</b><b>Sales</b><b>Cash</b><b>Card</b><b>Perks</b><b>Write-offs</b></div>
+                <div className="sbd-row sbd-row-head"><b>Staff</b><b>Signed in</b><b>Last active</b><b>Sales</b><b>Cash</b><b>Card</b><b>Perks</b><b>Write-offs</b><b>Stock</b></div>
                 {r.people.map((p) => (
                   <div className="sbd-row" key={p.name}>
                     <strong>{p.name}</strong>
@@ -115,6 +122,7 @@ export function StaffByDay() {
                     <span>{money(p.card)}</span>
                     <span className={p.perks ? "warn" : ""}>{p.perks ? `${p.perks} (${money(p.perkValue)})` : "-"}</span>
                     <span>{p.waste ? `${p.waste} (${money(p.wasteValue)})` : "-"}</span>
+                    <span>{p.stockChanges || p.scans ? `${p.stockChanges} changes${p.scans ? `, ${p.scans} scans` : ""}` : "-"}</span>
                   </div>
                 ))}
               </div>
